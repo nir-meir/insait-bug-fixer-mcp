@@ -1,11 +1,763 @@
-# server.py — Insight Bug Fixer MCP server entry point
-#
-# PLACEHOLDER created in PHASE 1 (file/folder structure only).
-# Implementation is added in later phases:
-#   PHASE 2 — MCP server setup, env loading, named prompt, tool definitions
-#   PHASE 3 — REST calls (agent, transcript, interactions)
-#   PHASE 4 — merge logic + knowledge file loading
-#   PHASE 5 — Opus 4.8 analysis call
-#   PHASE 6 — report writing
-#   PHASE 7 — save_dev_feedback
-#   PHASE 8 — error handling
+"""server.py — Insight Bug Fixer MCP server entry point.
+
+PHASE 2: MCP server setup, env var loading, the named prompt (section 3),
+and both tool definitions (section 4).
+PHASE 3: The three REST calls inside generate_bug_report (section 5, steps
+2-4) — agent fetch, transcript fetch, and the paginated interactions loop.
+PHASE 4: Merge logic (section 5, step 5) + knowledge file loading (step 6).
+PHASE 5: Opus 4.8 analysis call (section 5, step 7).
+PHASE 6: Report writing (section 5, step 8) — report_id, folder, file write.
+
+Later phases fill in the rest:
+  PHASE 7 — save_dev_feedback
+  PHASE 8 — error handling
+"""
+
+import asyncio
+import json
+import os
+import re
+from datetime import datetime
+
+import anthropic
+import httpx
+from dotenv import load_dotenv
+
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+import mcp.types as types
+
+# ---------------------------------------------------------------------------
+# Environment configuration
+# ---------------------------------------------------------------------------
+load_dotenv()
+
+INSAIT_API_KEY = os.environ.get("INSAIT_API_KEY")
+INSAIT_BASE_URL = os.environ.get("INSAIT_BASE_URL", "https://api-platform.insait.io")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+BUGFIXER_OUTPUT_DIR = os.environ.get("BUGFIXER_OUTPUT_DIR")
+BUGFIXER_KB_DIR = os.environ.get("BUGFIXER_KB_DIR")
+
+# ---------------------------------------------------------------------------
+# Section 3 — Session start instructions (named MCP prompt)
+# Copied verbatim from the spec.
+# ---------------------------------------------------------------------------
+BUG_FIXER_INSTRUCTIONS = """You are the Insight Bug Fixer assistant. Your job is to help developers
+analyze and fix bugs in the Insait platform's bot builder (UI/flow level only).
+
+When a developer asks you to analyze a bug, you MUST collect all three of the
+following before calling generate_bug_report. Do not call the tool if any are
+missing — ask for them one at a time if needed:
+
+  1. agent_id       — the agent's unique ID (found in the platform URL when
+                      viewing the agent, looks like a UUID or short alphanumeric ID)
+  2. bug_description — a detailed explanation of what went wrong, what the bot
+                      did, and what was expected instead. The more detail, the
+                      better the analysis. Do not accept a one-line description
+                      — ask the developer to elaborate if it's too vague.
+  3. conversation_id — the specific conversation ID where the bug occurred
+                      (found in the platform UI conversation detail page URL)
+
+Once you have all three, call generate_bug_report.
+
+After the report is generated, stay in the session. If the developer tells you
+the root cause or solution is wrong, ask them to explain the correct fix, then
+call save_dev_feedback with their correction and the report_id from the report
+you just generated.
+
+You only analyze UI-level and bot-builder-level issues. You do not debug
+platform backend code, infrastructure, or anything outside the flow/node
+configuration. If a bug is clearly a backend/infra issue, say so directly
+and suggest escalating to the right team."""
+
+# ---------------------------------------------------------------------------
+# Section 4 — Tool description strings.
+# Copied character-for-character from the spec (including newlines and
+# bullet characters).
+# ---------------------------------------------------------------------------
+GENERATE_BUG_REPORT_DESCRIPTION = (
+    "Analyzes a bug in an Insait platform bot and generates a Markdown root-cause report.\n"
+    "\n"
+    "BEFORE CALLING THIS TOOL — confirm all three inputs are present:\n"
+    "  • agent_id: the unique ID of the agent (from the platform URL). Ask the developer if missing.\n"
+    "  • bug_description: a detailed explanation of the bug — what happened, what was expected, which flow/node seems involved. If the developer gave a vague one-liner, ask them to elaborate before calling.\n"
+    "  • conversation_id: the specific conversation ID where the bug occurred (from the platform UI). Ask the developer if missing.\n"
+    "\n"
+    "Do NOT call this tool with placeholder, empty, or guessed values. Do NOT call it until all three are explicitly provided by the developer.\n"
+    "\n"
+    "On success, returns a report_id (local timestamp-based) and the path where the report was saved. Keep the report_id in context — it is needed if the developer wants to submit a correction via save_dev_feedback."
+)
+
+SAVE_DEV_FEEDBACK_DESCRIPTION = (
+    "Saves a developer correction to the local golden_examples.md file and writes a feedback record to the local output folder.\n"
+    "\n"
+    "Call this ONLY when:\n"
+    "  • A generate_bug_report has already been run in this session AND\n"
+    "  • The developer has explicitly told you the root cause or solution in the report was wrong AND\n"
+    "  • The developer has explained what the correct fix actually is\n"
+    "\n"
+    "Do NOT call this speculatively or before the developer has given you the actual correct answer.\n"
+    "\n"
+    "Requires the report_id returned by the generate_bug_report call in this session."
+)
+
+# ---------------------------------------------------------------------------
+# REST calls — section 5, steps 2-4
+# ---------------------------------------------------------------------------
+# Spec does not specify a request timeout; use a sane default. Full timeout
+# handling / messaging is added in PHASE 8.
+REQUEST_TIMEOUT = 30.0  # seconds
+
+# Safety cap on the interactions pagination loop. The spec has no reliable
+# has_more/total field (Known Open Item #1), so this guards against an
+# unbounded loop if the endpoint ignores `offset`.
+MAX_INTERACTION_PAGES = 1000
+
+
+def _headers() -> dict:
+    return {"X-API-Key": INSAIT_API_KEY or ""}
+
+
+def _build_node_name_map(flow_definition) -> dict:
+    """Build node_id -> human-readable node name map from flow_definition.
+
+    flow_definition's exact schema is not documented in the spec, so this is
+    defensive: it accepts a `nodes` list (or dict of nodes) and tries common
+    id/name keys.
+    """
+    node_map: dict = {}
+    if not isinstance(flow_definition, dict):
+        return node_map
+    nodes = flow_definition.get("nodes")
+    if isinstance(nodes, dict):
+        nodes = list(nodes.values())
+    if not isinstance(nodes, list):
+        return node_map
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        node_id = node.get("id") or node.get("node_id") or node.get("nodeId")
+        name = node.get("name") or node.get("label") or node.get("title")
+        if node_id is not None and name is not None:
+            node_map[str(node_id)] = name
+    return node_map
+
+
+def _extract_agent_name(agent_data, agent_id: str) -> str:
+    """Extract the agent/project name for folder naming; fall back to agent_id."""
+    if isinstance(agent_data, dict):
+        for key in ("name", "agent_name", "project_name", "display_name"):
+            value = agent_data.get(key)
+            if value:
+                return value
+    return agent_id
+
+
+def _extract_interaction_list(payload):
+    """Pull the list of interactions out of a page payload.
+
+    The response shape is not documented, so accept either a bare list or a
+    dict wrapping the list under a common key.
+    """
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("interactions", "data", "items", "results"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+async def _fetch_agent(agent_id: str):
+    """Step 2: GET /api/v1/agents/{agent_id}."""
+    url = f"{INSAIT_BASE_URL}/api/v1/agents/{agent_id}"
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        response = await client.get(url, headers=_headers())
+        response.raise_for_status()
+        return response.json()
+
+
+async def _fetch_transcript(conversation_id: str):
+    """Step 3: GET /api/v1/conversations/{conversation_id}/transcript.
+
+    Served as a file download (Content-Disposition: attachment); the body is
+    read and parsed as JSON. No pagination — a single call is always complete.
+    """
+    url = f"{INSAIT_BASE_URL}/api/v1/conversations/{conversation_id}/transcript"
+    params = {"include_tools": "true", "format": "json"}
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        response = await client.get(url, headers=_headers(), params=params)
+        response.raise_for_status()
+        return response.json()
+
+
+async def _fetch_interactions(conversation_id: str, organization_id, node_map: dict):
+    """Step 4: GET .../interactions, paginated by incrementing `offset`.
+
+    Loops until a short or empty page is returned (accepted heuristic — no
+    reliable has_more/total field). Resolves each interaction's node_id to a
+    node name using the map from Step 2.
+    """
+    url = f"{INSAIT_BASE_URL}/api/v1/chat/conversations/{conversation_id}/interactions"
+    interactions: list = []
+    offset = 0
+    page_size = None
+    pages_fetched = 0
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+        while True:
+            params = {
+                "organization_id": organization_id,
+                "offset": offset,
+                "include_debug": "true",
+            }
+            response = await client.get(url, headers=_headers(), params=params)
+            response.raise_for_status()
+            page = _extract_interaction_list(response.json())
+            pages_fetched += 1
+
+            if not page:
+                break  # empty page — done
+
+            for interaction in page:
+                if isinstance(interaction, dict):
+                    node_id = interaction.get("node_id") or interaction.get("nodeId")
+                    interaction["node_name"] = (
+                        node_map.get(str(node_id)) if node_id is not None else None
+                    )
+                interactions.append(interaction)
+
+            if page_size is None:
+                page_size = len(page)
+            if len(page) < page_size:
+                break  # short page — last page
+
+            offset += len(page)
+            if pages_fetched >= MAX_INTERACTION_PAGES:
+                break  # safety cap
+
+    return interactions
+
+
+# ---------------------------------------------------------------------------
+# Merge + knowledge loading — section 5, steps 5-6
+# ---------------------------------------------------------------------------
+# Per-turn debug-metadata fields (step 5). Each value is the list of candidate
+# keys tried, in order — the interaction/turn_events schema is undocumented
+# (Known Open Item #4), so extraction is defensive.
+DEBUG_METADATA_FIELDS = {
+    "exits": ["exits"],
+    "variables": ["variables"],
+    "rag_chunks": ["rag_chunks", "rag", "chunks"],
+    "tools": ["tools"],
+    "code": ["code"],
+    "security": ["security"],
+    "errors": ["errors"],
+}
+
+KNOWLEDGE_FILES = {
+    "claude_sessions_knowledge": "claude_sessions_knowledge.md",
+    "platform_best_practices": "platform_best_practices.md",
+    "golden_examples": "golden_examples.md",
+}
+
+
+def _extract_transcript_messages(transcript):
+    """Pull the ordered list of messages out of the transcript payload."""
+    if isinstance(transcript, list):
+        return transcript
+    if isinstance(transcript, dict):
+        for key in ("messages", "transcript", "data", "items"):
+            value = transcript.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def _extract_message_text(message):
+    """Extract human-readable text from a transcript message (defensive)."""
+    if isinstance(message, str):
+        return message
+    if isinstance(message, dict):
+        for key in ("text", "content", "message", "body"):
+            value = message.get(key)
+            if isinstance(value, str):
+                return value
+        content = message.get("content")
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("text") or block.get("content")
+                    if isinstance(text, str):
+                        parts.append(text)
+                elif isinstance(block, str):
+                    parts.append(block)
+            if parts:
+                return "\n".join(parts)
+    return ""
+
+
+def _extract_debug_metadata(turn_events, interaction):
+    """Extract per-turn debug metadata (exits, variables, rag chunks, tools,
+    code, security, errors) from turn_events / the interaction."""
+    metadata = {}
+    sources = [s for s in (turn_events, interaction) if isinstance(s, dict)]
+    for canonical, aliases in DEBUG_METADATA_FIELDS.items():
+        value = None
+        for src in sources:
+            for alias in aliases:
+                if src.get(alias) is not None:
+                    value = src.get(alias)
+                    break
+            if value is not None:
+                break
+        metadata[canonical] = value
+    # If turn_events is not a dict (e.g. a list of events), preserve it raw.
+    if turn_events is not None and not isinstance(turn_events, dict):
+        metadata["turn_events"] = turn_events
+    return metadata
+
+
+def _build_turn(seq, message, interaction):
+    """Build one unified per-turn record (message text + node name + debug)."""
+    turn = {
+        "seq": seq,
+        "message_text": _extract_message_text(message),
+        "node_name": interaction.get("node_name") if isinstance(interaction, dict) else None,
+    }
+    turn_events = interaction.get("turn_events") if isinstance(interaction, dict) else None
+    if turn_events is None:
+        # Noted as "no execution-side activity" — not missing data (step 5).
+        turn["execution"] = None
+    else:
+        turn["execution"] = _extract_debug_metadata(turn_events, interaction)
+    return turn
+
+
+def _merge_transcript_interactions(transcript, interactions):
+    """Step 5: join transcript messages with interactions by turn sequence.
+
+    interactions carry a `seq` field aligned to message order in the transcript
+    (numeric-string seq values are coerced to int for the index join). This
+    join is not yet verified against real data (Known Open Item #5), so any
+    interaction whose seq does not match a message index is still surfaced as
+    its own turn rather than dropped.
+    """
+    messages = _extract_transcript_messages(transcript)
+
+    by_seq = {}
+    for interaction in interactions:
+        if not isinstance(interaction, dict):
+            continue
+        seq = interaction.get("seq")
+        if seq is None:
+            continue
+        key = seq
+        try:
+            key = int(seq)
+        except (TypeError, ValueError):
+            pass
+        by_seq[key] = interaction
+
+    turns = []
+    consumed = set()
+    for index, message in enumerate(messages):
+        interaction = by_seq.get(index)
+        if interaction is not None:
+            consumed.add(index)
+        turns.append(_build_turn(index, message, interaction))
+
+    for key, interaction in by_seq.items():
+        if key not in consumed:
+            turns.append(_build_turn(key, None, interaction))
+
+    turns.sort(key=lambda t: t["seq"] if isinstance(t["seq"], int) else len(messages))
+    return turns
+
+
+def _read_kb_file(path, missing_ok=False):
+    if missing_ok and not os.path.exists(path):
+        return ""
+    with open(path, "r", encoding="utf-8") as handle:
+        return handle.read()
+
+
+def _load_knowledge():
+    """Step 6: read the three local knowledge files (full content).
+
+    golden_examples.md may not exist yet — inject an empty string silently.
+    """
+    kb_dir = BUGFIXER_KB_DIR or ""
+    return {
+        "claude_sessions_knowledge": _read_kb_file(
+            os.path.join(kb_dir, KNOWLEDGE_FILES["claude_sessions_knowledge"])
+        ),
+        "platform_best_practices": _read_kb_file(
+            os.path.join(kb_dir, KNOWLEDGE_FILES["platform_best_practices"])
+        ),
+        "golden_examples": _read_kb_file(
+            os.path.join(kb_dir, KNOWLEDGE_FILES["golden_examples"]), missing_ok=True
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Analysis — section 5, step 7
+# ---------------------------------------------------------------------------
+ANALYSIS_MODEL = "claude-opus-4-8"  # Opus 4.8
+ANALYSIS_MAX_TOKENS = 16000
+
+# Exact analysis prompt template from section 5, step 7. Wording and section
+# markers are verbatim; trailing whitespace at soft-wrap points is stripped.
+ANALYSIS_PROMPT_TEMPLATE = """You are an expert Insait platform bot debugger. Analyze the following bug report
+and provide:
+1. Root Cause — what specifically caused this bug at the flow/node/configuration level.
+2. Solution A — a fix tailored to this specific flow's context.
+3. Solution B — only if there is a genuinely different and valuable general best-practice
+   fix that differs meaningfully from Solution A. If Solution B would just restate
+   Solution A, omit it entirely. Do not invent a second solution to fill a template.
+
+Scope: UI and bot-builder level only (flow configuration, nodes, prompts, code blocks,
+tool configurations). Do not suggest backend/infrastructure fixes.
+
+--- BUG DESCRIPTION ---
+{bug_description}
+
+--- CONVERSATION TRANSCRIPT WITH EXECUTION TRACE ---
+{merged_per_turn_data}
+
+--- AGENT SYSTEM PROMPT ---
+{system_prompt}
+
+--- AGENT SECURITY PROMPT ---
+{security_prompt}
+
+--- FLOW DEFINITION (node structure) ---
+{flow_definition_summary}
+
+--- PLATFORM BEST PRACTICES ---
+{platform_best_practices}
+
+--- PAST SESSION KNOWLEDGE ---
+{claude_sessions_knowledge}
+
+--- APPROVED GOLDEN EXAMPLES ---
+{golden_examples}"""
+
+
+def _serialize(data) -> str:
+    """JSON-serialize structured data for inclusion in the analysis prompt."""
+    try:
+        return json.dumps(data, indent=2, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(data)
+
+
+def _render_node_name(node_name) -> str:
+    """Render a node name for output; None/empty -> '(unresolved)'."""
+    return node_name if node_name else "(unresolved)"
+
+
+async def _run_analysis(
+    bug_description,
+    merged_turns,
+    system_prompt,
+    security_prompt,
+    flow_definition,
+    knowledge,
+) -> str:
+    """Step 7: compose the analysis prompt and call Opus 4.8."""
+    # Render unresolved node names as "(unresolved)" rather than a bare None.
+    turns_for_prompt = [
+        {**turn, "node_name": _render_node_name(turn.get("node_name"))}
+        if isinstance(turn, dict)
+        else turn
+        for turn in merged_turns
+    ]
+    prompt = ANALYSIS_PROMPT_TEMPLATE.format(
+        bug_description=bug_description or "",
+        merged_per_turn_data=_serialize(turns_for_prompt),
+        system_prompt=system_prompt or "",
+        security_prompt=security_prompt or "",
+        flow_definition_summary=_serialize(flow_definition),
+        platform_best_practices=knowledge.get("platform_best_practices", ""),
+        claude_sessions_knowledge=knowledge.get("claude_sessions_knowledge", ""),
+        golden_examples=knowledge.get("golden_examples", ""),
+    )
+    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+    response = await client.messages.create(
+        model=ANALYSIS_MODEL,
+        max_tokens=ANALYSIS_MAX_TOKENS,
+        thinking={"type": "adaptive"},
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return "".join(block.text for block in response.content if block.type == "text")
+
+
+# ---------------------------------------------------------------------------
+# Report writing — section 5, step 8
+# ---------------------------------------------------------------------------
+# Relative count difference above which a pagination/merge mismatch warning is
+# added to the report header (step 4 cross-check). Threshold not specified by
+# the spec.
+COUNT_MISMATCH_RATIO = 0.2
+
+# In-memory registry of reports generated this session, keyed by report_id.
+# save_dev_feedback (PHASE 7) reads the original root cause from here — the
+# tool only receives a report_id, and the report's file path is not derivable
+# from report_id alone (the folder is the agent name, not the agent_id).
+REPORTS: dict = {}
+
+
+def _safe_folder_name(name) -> str:
+    """Make an agent/project name safe to use as a folder name."""
+    safe = re.sub(r"[^A-Za-z0-9._ -]", "_", str(name)).strip()
+    return safe or "unknown"
+
+
+def _pagination_warnings(interaction_count: int, transcript_message_count: int) -> list:
+    """Step 4 cross-check: warn if the interaction count differs significantly
+    from the transcript message count."""
+    warnings = []
+    larger = max(interaction_count, transcript_message_count)
+    if larger > 0 and abs(interaction_count - transcript_message_count) / larger > COUNT_MISMATCH_RATIO:
+        warnings.append(
+            f"Interaction count ({interaction_count}) differs significantly from "
+            f"transcript message count ({transcript_message_count}); data may be "
+            "incomplete (pagination heuristic — Known Open Item #1)."
+        )
+    return warnings
+
+
+def _extract_root_cause(analysis: str) -> str:
+    """Best-effort extraction of the Root Cause section from the analysis text.
+
+    The analysis is free-form model output, so this is heuristic: capture from
+    the first line mentioning 'root cause' until a line mentioning 'solution'.
+    """
+    if not analysis:
+        return ""
+    captured = []
+    capturing = False
+    for line in analysis.splitlines():
+        lower = line.lower()
+        if not capturing:
+            if "root cause" in lower:
+                capturing = True
+                captured.append(line)
+            continue
+        if "solution" in lower:
+            break
+        captured.append(line)
+    text = "\n".join(captured).strip()
+    return text or analysis.strip()
+
+
+def _build_report_markdown(agent_id, conversation_id, timestamp, report_id, analysis, warnings) -> str:
+    lines = [
+        "# Bug Report",
+        "",
+        f"- **report_id:** {report_id}",
+        f"- **agent_id:** {agent_id}",
+        f"- **conversation_id:** {conversation_id}",
+        f"- **timestamp:** {timestamp}",
+    ]
+    if warnings:
+        lines.append("- **warnings:**")
+        lines.extend(f"  - {warning}" for warning in warnings)
+    lines.extend(["", "## Analysis", "", analysis or "", ""])
+    return "\n".join(lines)
+
+
+def _write_bug_report(agent_id, agent_name, conversation_id, timestamp, report_id, analysis, warnings) -> str:
+    """Create the output folder and write bug_report_{timestamp}.md."""
+    folder = os.path.join(BUGFIXER_OUTPUT_DIR or "", _safe_folder_name(agent_name))
+    os.makedirs(folder, exist_ok=True)
+    file_path = os.path.join(folder, f"bug_report_{timestamp}.md")
+    content = _build_report_markdown(
+        agent_id, conversation_id, timestamp, report_id, analysis, warnings
+    )
+    with open(file_path, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    return file_path
+
+
+async def generate_bug_report(agent_id, bug_description, conversation_id):
+    """Orchestrates the bug-report data flow (section 5).
+
+    PHASE 3 implemented steps 2-4 (the three REST calls). PHASE 4 added steps
+    5-6 (merge + knowledge loading). PHASE 5 added step 7 (Opus 4.8 analysis).
+    PHASE 6 adds step 8 (report_id, folder creation, report file write).
+    """
+    # Step 2: fetch agent data + derive node map and agent name.
+    agent_data = await _fetch_agent(agent_id)
+    system_prompt = agent_data.get("system_prompt") if isinstance(agent_data, dict) else None
+    security_prompt = agent_data.get("security_prompt") if isinstance(agent_data, dict) else None
+    flow_definition = agent_data.get("flow_definition") if isinstance(agent_data, dict) else None
+    organization_id = agent_data.get("organization_id") if isinstance(agent_data, dict) else None
+    node_map = _build_node_name_map(flow_definition)
+    agent_name = _extract_agent_name(agent_data, agent_id)
+
+    # Step 3: fetch transcript (single call, no pagination).
+    transcript = await _fetch_transcript(conversation_id)
+
+    # Step 4: fetch interactions (paginated), resolving node names.
+    interactions = await _fetch_interactions(conversation_id, organization_id, node_map)
+
+    # Step 5: merge transcript + interactions into a per-turn structure.
+    merged_turns = _merge_transcript_interactions(transcript, interactions)
+
+    # Step 6: load local knowledge files.
+    knowledge = _load_knowledge()
+
+    # Step 7: send everything to Opus 4.8 for analysis.
+    analysis = await _run_analysis(
+        bug_description,
+        merged_turns,
+        system_prompt,
+        security_prompt,
+        flow_definition,
+        knowledge,
+    )
+
+    # Step 8: generate report_id, write the report, return a summary.
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_id = f"{agent_id}_{timestamp}"
+    transcript_message_count = len(_extract_transcript_messages(transcript))
+    warnings = _pagination_warnings(len(interactions), transcript_message_count)
+    file_path = _write_bug_report(
+        agent_id, agent_name, conversation_id, timestamp, report_id, analysis, warnings
+    )
+    root_cause = _extract_root_cause(analysis)
+
+    # Record what save_dev_feedback (PHASE 7) will need, keyed by report_id.
+    REPORTS[report_id] = {
+        "agent_id": agent_id,
+        "agent_name": agent_name,
+        "conversation_id": conversation_id,
+        "timestamp": timestamp,
+        "bug_description": bug_description,
+        "analysis": analysis,
+        "root_cause": root_cause,
+        "file_path": file_path,
+    }
+
+    summary = root_cause.strip()
+    if len(summary) > 300:
+        summary = summary[:300].rstrip() + "…"
+
+    return [
+        types.TextContent(
+            type="text",
+            text=(
+                f"Report generated.\n"
+                f"- report_id: {report_id}\n"
+                f"- path: {file_path}\n\n"
+                f"Root cause summary:\n{summary}"
+            ),
+        )
+    ]
+
+
+# ---------------------------------------------------------------------------
+# MCP server
+# ---------------------------------------------------------------------------
+app = Server("insight-bug-fixer")
+
+
+@app.list_prompts()
+async def list_prompts() -> list[types.Prompt]:
+    return [
+        types.Prompt(
+            name="bug_fixer_instructions",
+            description="Session start instructions for the Insight Bug Fixer assistant.",
+            arguments=[],
+        )
+    ]
+
+
+@app.get_prompt()
+async def get_prompt(name: str, arguments: dict | None) -> types.GetPromptResult:
+    if name != "bug_fixer_instructions":
+        raise ValueError(f"Unknown prompt: {name}")
+    return types.GetPromptResult(
+        messages=[
+            types.PromptMessage(
+                role="user",
+                content=types.TextContent(type="text", text=BUG_FIXER_INSTRUCTIONS),
+            )
+        ]
+    )
+
+
+@app.list_tools()
+async def list_tools() -> list[types.Tool]:
+    return [
+        types.Tool(
+            name="generate_bug_report",
+            description=GENERATE_BUG_REPORT_DESCRIPTION,
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "The unique identifier of the agent in the Insait platform",
+                    },
+                    "bug_description": {
+                        "type": "string",
+                        "description": "Detailed explanation of the bug — what happened, what was expected, which node/flow seems involved",
+                    },
+                    "conversation_id": {
+                        "type": "string",
+                        "description": "The unique identifier of the conversation where the bug occurred",
+                    },
+                },
+                "required": ["agent_id", "bug_description", "conversation_id"],
+            },
+        ),
+        types.Tool(
+            name="save_dev_feedback",
+            description=SAVE_DEV_FEEDBACK_DESCRIPTION,
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "report_id": {
+                        "type": "string",
+                        "description": "The report_id returned by generate_bug_report in this session",
+                    },
+                    "user_correction": {
+                        "type": "string",
+                        "description": "The correct root cause and/or solution as explained by the developer",
+                    },
+                },
+                "required": ["report_id", "user_correction"],
+            },
+        ),
+    ]
+
+
+@app.call_tool()
+async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    if name == "generate_bug_report":
+        return await generate_bug_report(
+            arguments.get("agent_id"),
+            arguments.get("bug_description"),
+            arguments.get("conversation_id"),
+        )
+    # PHASE 2: save_dev_feedback is registered but not yet implemented (PHASE 7).
+    if name == "save_dev_feedback":
+        return [types.TextContent(type="text", text="save_dev_feedback is not yet implemented.")]
+    raise ValueError(f"Unknown tool: {name}")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+async def main() -> None:
+    async with stdio_server() as (read_stream, write_stream):
+        await app.run(read_stream, write_stream, app.create_initialization_options())
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
