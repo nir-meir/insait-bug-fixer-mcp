@@ -1,0 +1,5 @@
+# Secrets
+.env
+
+# Generated bug reports (local output)
+reports/
