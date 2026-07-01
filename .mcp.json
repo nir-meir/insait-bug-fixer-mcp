@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "insight-bug-fixer": {
+      "command": "/Users/nirmeir/insait-bug-fixer-mcp/.venv/bin/python",
+      "args": ["/Users/nirmeir/insait-bug-fixer-mcp/server.py"]
+    }
+  }
+}

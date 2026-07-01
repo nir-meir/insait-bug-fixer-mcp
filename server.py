@@ -31,7 +31,10 @@ import mcp.types as types
 # ---------------------------------------------------------------------------
 # Environment configuration
 # ---------------------------------------------------------------------------
-load_dotenv()
+# Load .env sitting next to this file, regardless of the launcher's cwd (the
+# MCP client may start the server from a different directory). Real env vars
+# already set by the launcher are not overridden.
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 INSAIT_API_KEY = os.environ.get("INSAIT_API_KEY")
 INSAIT_BASE_URL = os.environ.get("INSAIT_BASE_URL", "https://api-platform.insait.io")
@@ -149,16 +152,19 @@ def _first_missing(fields: dict):
 
 
 def _build_node_name_map(flow_definition) -> dict:
-    """Build node_id -> human-readable node name map from flow_definition.
+    """Build node_id -> human-readable node name map.
 
-    flow_definition's exact schema is not documented in the spec, so this is
-    defensive: it accepts a `nodes` list (or dict of nodes) and tries common
-    id/name keys.
+    Verified against the live Insait API: nodes live at
+    flow_definition["flow"]["nodes"] (a dict keyed by node_id, each value a node
+    with a `name`). Falls back to a top-level "nodes" for robustness.
     """
     node_map: dict = {}
     if not isinstance(flow_definition, dict):
         return node_map
-    nodes = flow_definition.get("nodes")
+    flow = flow_definition.get("flow")
+    nodes = flow.get("nodes") if isinstance(flow, dict) else None
+    if nodes is None:
+        nodes = flow_definition.get("nodes")  # fallback
     if isinstance(nodes, dict):
         nodes = list(nodes.values())
     if not isinstance(nodes, list):
@@ -285,19 +291,6 @@ async def _fetch_interactions(conversation_id: str, organization_id, node_map: d
 # ---------------------------------------------------------------------------
 # Merge + knowledge loading — section 5, steps 5-6
 # ---------------------------------------------------------------------------
-# Per-turn debug-metadata fields (step 5). Each value is the list of candidate
-# keys tried, in order — the interaction/turn_events schema is undocumented
-# (Known Open Item #4), so extraction is defensive.
-DEBUG_METADATA_FIELDS = {
-    "exits": ["exits"],
-    "variables": ["variables"],
-    "rag_chunks": ["rag_chunks", "rag", "chunks"],
-    "tools": ["tools"],
-    "code": ["code"],
-    "security": ["security"],
-    "errors": ["errors"],
-}
-
 KNOWLEDGE_FILES = {
     "claude_sessions_knowledge": "claude_sessions_knowledge.md",
     "platform_best_practices": "platform_best_practices.md",
@@ -317,106 +310,115 @@ def _extract_transcript_messages(transcript):
     return []
 
 
-def _extract_message_text(message):
-    """Extract human-readable text from a transcript message (defensive)."""
-    if isinstance(message, str):
+# debug_info fields kept in the execution trace (spec step-5 signals). Other
+# fields are dropped. Verified live: these are the meaningful execution signals;
+# the bulky `rag` chunk text is slimmed separately (see _trim_debug_info).
+DEBUG_INFO_KEEP = (
+    "exits",
+    "transition_exit_id",
+    "variables",
+    "field_extractions",
+    "security",
+    "errors",
+    "tools",
+    "code_executions",
+    "rag",
+)
+
+
+# Full-text fields dropped from each kept RAG chunk (they carry the document
+# body; metadata like document_name/score is kept).
+RAG_CHUNK_DROP = ("content", "enriched_text")
+
+# Lightweight fields kept for NON-taken exit candidates (the taken exit is kept
+# in full). Drops the bulky `condition` expression from candidates.
+EXIT_SLIM_KEEP = ("id", "name", "priority", "target_node_id")
+
+
+def _slim_exits(exits, taken_id):
+    """Keep the taken exit in full; reduce other candidates to light metadata."""
+    if not isinstance(exits, list):
+        return exits
+    slim = []
+    for e in exits:
+        if not isinstance(e, dict):
+            slim.append(e)
+            continue
+        if e.get("id") == taken_id:
+            slim.append(e)  # taken exit — keep full
+        else:
+            slim.append({k: e[k] for k in EXIT_SLIM_KEEP if k in e})
+    return slim
+
+
+def _trim_debug_info(debug_info):
+    """Keep the key execution-signal fields; strip bulky RAG and exit payloads.
+
+    Verified live: `rag` dominates debug_info (~150KB) via `all_chunks` + full
+    document text; `exits` (~22KB) is mostly non-taken branch conditions. We
+    drop `all_chunks`, strip chunk full-text, and collapse non-taken exits to
+    metadata — keeping "what was retrieved" and "which branch fired" without the
+    bulk.
+    """
+    if not isinstance(debug_info, dict):
+        return debug_info
+    trimmed = {k: debug_info[k] for k in DEBUG_INFO_KEEP if k in debug_info}
+    rag = trimmed.get("rag")
+    if isinstance(rag, dict):
+        slim_rag = {k: v for k, v in rag.items() if k != "all_chunks"}
+        if isinstance(slim_rag.get("chunks"), list):
+            slim_rag["chunks"] = [
+                {k: v for k, v in chunk.items() if k not in RAG_CHUNK_DROP}
+                if isinstance(chunk, dict) else chunk
+                for chunk in slim_rag["chunks"]
+            ]
+        trimmed["rag"] = slim_rag
+    if "exits" in trimmed:
+        trimmed["exits"] = _slim_exits(trimmed["exits"], debug_info.get("transition_exit_id"))
+    return trimmed
+
+
+# Transcript = conversation only. Execution data (rag_chunks, tool_metadata)
+# is dropped here because it is duplicated — trimmed — in execution_trace's
+# debug_info. Keeps the transcript to the fields a reader needs.
+TRANSCRIPT_KEEP = ("role", "content", "timestamp")
+
+
+def _trim_transcript_message(message):
+    """Reduce a transcript message to conversational fields only."""
+    if not isinstance(message, dict):
         return message
-    if isinstance(message, dict):
-        for key in ("text", "content", "message", "body"):
-            value = message.get(key)
-            if isinstance(value, str):
-                return value
-        content = message.get("content")
-        if isinstance(content, list):
-            parts = []
-            for block in content:
-                if isinstance(block, dict):
-                    text = block.get("text") or block.get("content")
-                    if isinstance(text, str):
-                        parts.append(text)
-                elif isinstance(block, str):
-                    parts.append(block)
-            if parts:
-                return "\n".join(parts)
-    return ""
-
-
-def _extract_debug_metadata(turn_events, interaction):
-    """Extract per-turn debug metadata (exits, variables, rag chunks, tools,
-    code, security, errors) from turn_events / the interaction."""
-    metadata = {}
-    sources = [s for s in (turn_events, interaction) if isinstance(s, dict)]
-    for canonical, aliases in DEBUG_METADATA_FIELDS.items():
-        value = None
-        for src in sources:
-            for alias in aliases:
-                if src.get(alias) is not None:
-                    value = src.get(alias)
-                    break
-            if value is not None:
-                break
-        metadata[canonical] = value
-    # If turn_events is not a dict (e.g. a list of events), preserve it raw.
-    if turn_events is not None and not isinstance(turn_events, dict):
-        metadata["turn_events"] = turn_events
-    return metadata
-
-
-def _build_turn(seq, message, interaction):
-    """Build one unified per-turn record (message text + node name + debug)."""
-    turn = {
-        "seq": seq,
-        "message_text": _extract_message_text(message),
-        "node_name": interaction.get("node_name") if isinstance(interaction, dict) else None,
-    }
-    turn_events = interaction.get("turn_events") if isinstance(interaction, dict) else None
-    if turn_events is None:
-        # Noted as "no execution-side activity" — not missing data (step 5).
-        turn["execution"] = None
-    else:
-        turn["execution"] = _extract_debug_metadata(turn_events, interaction)
-    return turn
+    return {k: message[k] for k in TRANSCRIPT_KEEP if k in message}
 
 
 def _merge_transcript_interactions(transcript, interactions):
-    """Step 5: join transcript messages with interactions by turn sequence.
+    """Step 5: produce a complete conversation record for the client.
 
-    interactions carry a `seq` field aligned to message order in the transcript
-    (numeric-string seq values are coerced to int for the index join). This
-    join is not yet verified against real data (Known Open Item #5), so any
-    interaction whose seq does not match a message index is still surfaced as
-    its own turn rather than dropped.
+    The transcript (all messages) and the interactions (the execution trace)
+    are different granularities and do not map 1:1 — verified against the live
+    API (e.g. 13 interactions vs 25 messages; interactions use a non-unique
+    `sequence_number`). So instead of a lossy join, return BOTH:
+      {"transcript": [...conversation only...],
+       "execution_trace": [...all interactions, node_name-enriched...]}
+    Division of labor (no duplication): the transcript carries the conversation
+    (role/content/timestamp); execution_trace carries the execution (node,
+    debug_info). Each interaction's debug_info is trimmed to the key signals.
     """
     messages = _extract_transcript_messages(transcript)
-
-    by_seq = {}
-    for interaction in interactions:
-        if not isinstance(interaction, dict):
-            continue
-        seq = interaction.get("seq")
-        if seq is None:
-            continue
-        key = seq
-        try:
-            key = int(seq)
-        except (TypeError, ValueError):
-            pass
-        by_seq[key] = interaction
-
-    turns = []
-    consumed = set()
-    for index, message in enumerate(messages):
-        interaction = by_seq.get(index)
-        if interaction is not None:
-            consumed.add(index)
-        turns.append(_build_turn(index, message, interaction))
-
-    for key, interaction in by_seq.items():
-        if key not in consumed:
-            turns.append(_build_turn(key, None, interaction))
-
-    turns.sort(key=lambda t: t["seq"] if isinstance(t["seq"], int) else len(messages))
-    return turns
+    trimmed_transcript = [_trim_transcript_message(m) for m in messages]
+    trace = []
+    for i in interactions:
+        if isinstance(i, dict):
+            entry = dict(i)
+            if "debug_info" in entry:
+                entry["debug_info"] = _trim_debug_info(entry["debug_info"])
+            trace.append(entry)
+        else:
+            trace.append(i)
+    return {
+        "transcript": trimmed_transcript,
+        "execution_trace": trace,
+    }
 
 
 def _read_kb_file(path, missing_ok=False):
@@ -501,29 +503,35 @@ def _render_node_name(node_name) -> str:
 
 def _build_analysis_context(
     bug_description,
-    merged_turns,
+    merged,
     system_prompt,
     security_prompt,
-    flow_definition,
+    flow_for_prompt,
     knowledge,
 ) -> str:
     """Step 7: compose the analysis context string returned to the client.
 
+    `merged` is {"transcript": [...], "execution_trace": [...]}.
     No model call — the MCP client (Claude) performs the analysis.
     """
+    trace = merged.get("execution_trace", []) if isinstance(merged, dict) else []
     # Render unresolved node names as "(unresolved)" rather than a bare None.
-    turns_for_prompt = [
-        {**turn, "node_name": _render_node_name(turn.get("node_name"))}
-        if isinstance(turn, dict)
-        else turn
-        for turn in merged_turns
+    rendered_trace = [
+        {**t, "node_name": _render_node_name(t.get("node_name"))}
+        if isinstance(t, dict)
+        else t
+        for t in trace
     ]
+    conversation = {
+        "transcript": merged.get("transcript", []) if isinstance(merged, dict) else [],
+        "execution_trace": rendered_trace,
+    }
     return ANALYSIS_PROMPT_TEMPLATE.format(
         bug_description=bug_description or "",
-        merged_per_turn_data=_serialize(turns_for_prompt),
+        merged_per_turn_data=_serialize(conversation),
         system_prompt=system_prompt or "",
         security_prompt=security_prompt or "",
-        flow_definition_summary=_serialize(flow_definition),
+        flow_definition_summary=_serialize(flow_for_prompt),
         platform_best_practices=knowledge.get("platform_best_practices", ""),
         claude_sessions_knowledge=knowledge.get("claude_sessions_knowledge", ""),
         golden_examples=knowledge.get("golden_examples", ""),
@@ -531,13 +539,66 @@ def _build_analysis_context(
 
 
 # ---------------------------------------------------------------------------
+# Flow trimming — keep only the nodes the conversation touched (neighbors opt-in)
+# ---------------------------------------------------------------------------
+def _trim_flow(flow_definition, touched_ids, include_neighbors=False):
+    """Return (trimmed_flow_definition, missing_node_ids).
+
+    Keeps only the nodes the conversation touched (and, if include_neighbors,
+    their direct neighbors one edge away via flow["exits"]); prunes the rest.
+    flow["exits"] is still kept for any edge touching an included node, so the
+    routing decisions from/into executed nodes are visible even when the
+    neighbor node body is not included. All other flow data (variables, tools,
+    settings, start_node_id, subflow_groups) is kept intact. Verified against
+    the live API: nodes at flow["flow"]["nodes"], edges at flow["flow"]["exits"]
+    with source_node_id / target_node_id.
+    """
+    if not isinstance(flow_definition, dict):
+        return flow_definition, []
+    flow = flow_definition.get("flow")
+    if not isinstance(flow, dict) or not isinstance(flow.get("nodes"), dict):
+        return flow_definition, []
+
+    nodes = flow["nodes"]
+    exits = flow.get("exits") if isinstance(flow.get("exits"), list) else []
+
+    touched = {t for t in touched_ids if t in nodes}
+    missing = [t for t in dict.fromkeys(touched_ids) if t not in nodes]
+
+    included = set(touched)
+    if include_neighbors:
+        for e in exits:
+            if not isinstance(e, dict):
+                continue
+            s, t = e.get("source_node_id"), e.get("target_node_id")
+            if s in touched or t in touched:
+                if s is not None:
+                    included.add(s)
+                if t is not None:
+                    included.add(t)
+
+    trimmed_flow = dict(flow)
+    trimmed_flow["nodes"] = {nid: nodes[nid] for nid in included if nid in nodes}
+    trimmed_flow["exits"] = [
+        e for e in exits
+        if isinstance(e, dict)
+        and (e.get("source_node_id") in included or e.get("target_node_id") in included)
+    ]
+    jumps = flow.get("jump_nodes")
+    if isinstance(jumps, list):
+        trimmed_flow["jump_nodes"] = [
+            j for j in jumps
+            if isinstance(j, dict) and j.get("data", {}).get("targetNodeId") in included
+        ]
+
+    trimmed_fd = dict(flow_definition)
+    trimmed_fd["flow"] = trimmed_flow
+    return trimmed_fd, missing
+
+
+# ---------------------------------------------------------------------------
 # Report writing — section 5, step 8
 # ---------------------------------------------------------------------------
-# Relative count difference above which a pagination/merge mismatch warning is
-# added to the report header (step 4 cross-check). Threshold not specified by
-# the spec.
-COUNT_MISMATCH_RATIO = 0.2
-
 # In-memory registry of reports generated this session, keyed by report_id.
 # save_dev_feedback (PHASE 7) reads the original root cause from here — the
 # tool only receives a report_id, and the report's file path is not derivable
@@ -549,20 +610,6 @@ def _safe_folder_name(name) -> str:
     """Make an agent/project name safe to use as a folder name."""
     safe = re.sub(r"[^A-Za-z0-9._ -]", "_", str(name)).strip()
     return safe or "unknown"
-
-
-def _pagination_warnings(interaction_count: int, transcript_message_count: int) -> list:
-    """Step 4 cross-check: warn if the interaction count differs significantly
-    from the transcript message count."""
-    warnings = []
-    larger = max(interaction_count, transcript_message_count)
-    if larger > 0 and abs(interaction_count - transcript_message_count) / larger > COUNT_MISMATCH_RATIO:
-        warnings.append(
-            f"Interaction count ({interaction_count}) differs significantly from "
-            f"transcript message count ({transcript_message_count}); data may be "
-            "incomplete (pagination heuristic — Known Open Item #1)."
-        )
-    return warnings
 
 
 def _extract_root_cause(analysis: str) -> str:
@@ -615,6 +662,18 @@ def _write_bug_report(agent_id, agent_name, conversation_id, timestamp, report_i
     )
     with open(file_path, "w", encoding="utf-8") as handle:
         handle.write(content)
+    return file_path
+
+
+def _write_gather_context(agent_name, timestamp, text) -> str:
+    """Always persist the full gather context (exactly what is handed to the MCP
+    client) to a local file, so it is inspectable on every run. Local write
+    only — never sent anywhere. May contain conversation PII."""
+    folder = os.path.join(BUGFIXER_OUTPUT_DIR or "", _safe_folder_name(agent_name))
+    os.makedirs(folder, exist_ok=True)
+    file_path = os.path.join(folder, f"gather_context_{timestamp}.txt")
+    with open(file_path, "w", encoding="utf-8") as handle:
+        handle.write(text)
     return file_path
 
 
@@ -688,19 +747,26 @@ async def generate_bug_report(agent_id, bug_description, conversation_id):
         conversation_id, organization_id, node_map
     )
 
-    # Step 5: merge transcript + interactions into a per-turn structure.
-    merged_turns = _merge_transcript_interactions(transcript, interactions)
+    # Step 5: build a complete conversation record (transcript + execution trace).
+    merged = _merge_transcript_interactions(transcript, interactions)
 
     # Step 6: load local knowledge files.
     knowledge = _load_knowledge()
 
+    # Trim the flow to the nodes this conversation touched (+ their neighbors).
+    touched_ids = [
+        i.get("node_id") for i in interactions
+        if isinstance(i, dict) and i.get("node_id")
+    ]
+    flow_for_prompt, missing_nodes = _trim_flow(flow_definition, touched_ids)
+
     # Step 7: compose the analysis context (no model call — the client analyzes).
     analysis_context = _build_analysis_context(
         bug_description,
-        merged_turns,
+        merged,
         system_prompt,
         security_prompt,
-        flow_definition,
+        flow_for_prompt,
         knowledge,
     )
 
@@ -708,8 +774,17 @@ async def generate_bug_report(agent_id, bug_description, conversation_id):
     # need. The report file is written later by save_bug_report.
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     report_id = f"{agent_id}_{timestamp}"
-    transcript_message_count = len(_extract_transcript_messages(transcript))
-    warnings = _pagination_warnings(len(interactions), transcript_message_count)
+    warnings = []
+    if not interactions:
+        warnings.append(
+            "No execution/interaction data was returned for this conversation."
+        )
+    if missing_nodes:
+        warnings.append(
+            f"{len(missing_nodes)} node(s) used in the conversation are not in the "
+            "current flow version (the flow changed since; their definitions are "
+            f"unavailable): {missing_nodes}"
+        )
     if partial_warning:
         warnings.append(partial_warning)
 
@@ -725,12 +800,35 @@ async def generate_bug_report(agent_id, bug_description, conversation_id):
         "file_path": None,
     }
 
+    return_text = (
+        f"report_id: {report_id}\n\n"
+        "Analyze the bug using the context below, then call "
+        "save_bug_report with this report_id and your analysis "
+        "(Root Cause, Solution A, and Solution B only if warranted).\n\n"
+        f"{analysis_context}"
+    )
+
+    # Always persist the full gather context locally so it is inspectable on
+    # every run (best-effort — a write failure must not block the tool).
+    try:
+        gather_path = _write_gather_context(agent_name, timestamp, return_text)
+        REPORTS[report_id]["gather_context_path"] = gather_path
+    except OSError as exc:
+        gather_path = None
+        REPORTS[report_id]["gather_context_path"] = None
+        warnings.append(f"Could not save the gather-context file locally ({exc}).")
+
+    header = f"report_id: {report_id}\n"
+    if gather_path:
+        header += f"(Full gather context saved to: {gather_path})\n"
+    header += "\n"
+
     return [
         types.TextContent(
             type="text",
             text=(
-                f"report_id: {report_id}\n\n"
-                "Analyze the bug using the context below, then call "
+                header
+                + "Analyze the bug using the context below, then call "
                 "save_bug_report with this report_id and your analysis "
                 "(Root Cause, Solution A, and Solution B only if warranted).\n\n"
                 f"{analysis_context}"
