@@ -1,15 +1,18 @@
 """server.py — Insight Bug Fixer MCP server entry point.
 
-PHASE 2: MCP server setup, env var loading, the named prompt (section 3),
-and both tool definitions (section 4).
-PHASE 3: The three REST calls inside generate_bug_report (section 5, steps
-2-4) — agent fetch, transcript fetch, and the paginated interactions loop.
-PHASE 4: Merge logic (section 5, step 5) + knowledge file loading (step 6).
-PHASE 5: Opus 4.8 analysis call (section 5, step 7).
-PHASE 6: Report writing (section 5, step 8) — report_id, folder, file write.
-PHASE 7: save_dev_feedback (section 5, step 9) — golden_examples append +
-         feedback file write.
-PHASE 8: Full error handling across all functions (section 8).
+Data-provider design (matches the Insait Platform MCP): the server never calls
+an LLM. It gathers data and returns it to the MCP client (Claude), which does
+the analysis; a second tool saves the client's analysis. No ANTHROPIC_API_KEY.
+
+Tools:
+  generate_bug_report  — gather agent/transcript/interactions + knowledge,
+                         return the analysis context + a report_id.
+  save_bug_report      — write the client-produced analysis to a report file.
+  save_dev_feedback    — append a developer correction to golden_examples.md.
+
+The Insait REST data flow (section 5, steps 2-6), report format (step 8), and
+golden_examples format (step 9) are unchanged; the Opus 4.8 call (step 7) is
+removed. A None node name renders as "(unresolved)".
 """
 
 import asyncio
@@ -18,7 +21,6 @@ import os
 import re
 from datetime import datetime
 
-import anthropic
 import httpx
 from dotenv import load_dotenv
 
@@ -33,13 +35,13 @@ load_dotenv()
 
 INSAIT_API_KEY = os.environ.get("INSAIT_API_KEY")
 INSAIT_BASE_URL = os.environ.get("INSAIT_BASE_URL", "https://api-platform.insait.io")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 BUGFIXER_OUTPUT_DIR = os.environ.get("BUGFIXER_OUTPUT_DIR")
 BUGFIXER_KB_DIR = os.environ.get("BUGFIXER_KB_DIR")
 
 # ---------------------------------------------------------------------------
 # Section 3 — Session start instructions (named MCP prompt)
-# Copied verbatim from the spec.
+# Adapted from the spec for the data-provider design: the client (Claude)
+# performs the analysis, so the flow is gather -> analyze -> save.
 # ---------------------------------------------------------------------------
 BUG_FIXER_INSTRUCTIONS = """You are the Insight Bug Fixer assistant. Your job is to help developers
 analyze and fix bugs in the Insait platform's bot builder (UI/flow level only).
@@ -57,12 +59,17 @@ missing — ask for them one at a time if needed:
   3. conversation_id — the specific conversation ID where the bug occurred
                       (found in the platform UI conversation detail page URL)
 
-Once you have all three, call generate_bug_report.
+Once you have all three, call generate_bug_report. It does not analyze the bug
+itself — it returns a report_id and a context block (conversation trace, agent
+configuration, and knowledge base). YOU perform the analysis: read that context
+and produce the Root Cause, Solution A, and (only if genuinely different and
+valuable) Solution B, following the instructions in the returned context. Then
+call save_bug_report with that report_id and your analysis text to write the
+report.
 
-After the report is generated, stay in the session. If the developer tells you
-the root cause or solution is wrong, ask them to explain the correct fix, then
-call save_dev_feedback with their correction and the report_id from the report
-you just generated.
+After the report is saved, stay in the session. If the developer tells you the
+root cause or solution is wrong, ask them to explain the correct fix, then call
+save_dev_feedback with their correction and the report_id from this session.
 
 You only analyze UI-level and bot-builder-level issues. You do not debug
 platform backend code, infrastructure, or anything outside the flow/node
@@ -71,11 +78,13 @@ and suggest escalating to the right team."""
 
 # ---------------------------------------------------------------------------
 # Section 4 — Tool description strings.
-# Copied character-for-character from the spec (including newlines and
-# bullet characters).
+# save_dev_feedback is verbatim from the spec; generate_bug_report is adapted
+# (it now gathers and returns context), and save_bug_report is new.
 # ---------------------------------------------------------------------------
 GENERATE_BUG_REPORT_DESCRIPTION = (
-    "Analyzes a bug in an Insait platform bot and generates a Markdown root-cause report.\n"
+    "Gathers everything needed to analyze a bug in an Insait platform bot and returns it for YOU to analyze.\n"
+    "\n"
+    "This tool does NOT analyze the bug or write the report. It fetches the conversation transcript, execution trace, agent configuration, and knowledge base, and returns a report_id plus a context block. You then read the context, produce the Root Cause / Solution A / Solution B analysis, and call save_bug_report with the report_id and your analysis.\n"
     "\n"
     "BEFORE CALLING THIS TOOL — confirm all three inputs are present:\n"
     "  • agent_id: the unique ID of the agent (from the platform URL). Ask the developer if missing.\n"
@@ -84,14 +93,23 @@ GENERATE_BUG_REPORT_DESCRIPTION = (
     "\n"
     "Do NOT call this tool with placeholder, empty, or guessed values. Do NOT call it until all three are explicitly provided by the developer.\n"
     "\n"
-    "On success, returns a report_id (local timestamp-based) and the path where the report was saved. Keep the report_id in context — it is needed if the developer wants to submit a correction via save_dev_feedback."
+    "Keep the returned report_id in context — it is required for save_bug_report and for save_dev_feedback."
+)
+
+
+SAVE_BUG_REPORT_DESCRIPTION = (
+    "Writes YOUR bug analysis to a local Markdown report file.\n"
+    "\n"
+    "Call this after generate_bug_report, once you have produced the analysis (Root Cause, Solution A, and Solution B if warranted) from the context that generate_bug_report returned.\n"
+    "\n"
+    "Requires the report_id returned by generate_bug_report in this session and your analysis text. On success, returns the report_id and the path where the report was saved. Keep the report_id — it is needed if the developer wants to submit a correction via save_dev_feedback."
 )
 
 SAVE_DEV_FEEDBACK_DESCRIPTION = (
     "Saves a developer correction to the local golden_examples.md file and writes a feedback record to the local output folder.\n"
     "\n"
     "Call this ONLY when:\n"
-    "  • A generate_bug_report has already been run in this session AND\n"
+    "  • A bug report has already been generated and saved in this session AND\n"
     "  • The developer has explicitly told you the root cause or solution in the report was wrong AND\n"
     "  • The developer has explained what the correct fix actually is\n"
     "\n"
@@ -428,13 +446,10 @@ def _load_knowledge():
 
 
 # ---------------------------------------------------------------------------
-# Analysis — section 5, step 7
+# Analysis context — section 5, step 7 (composed here, analyzed by the client)
 # ---------------------------------------------------------------------------
-ANALYSIS_MODEL = "claude-opus-4-8"  # Opus 4.8
-ANALYSIS_MAX_TOKENS = 16000
-
-# Exact analysis prompt template from section 5, step 7. Wording and section
-# markers are verbatim; trailing whitespace at soft-wrap points is stripped.
+# The server no longer calls a model. This template (verbatim from step 7) is
+# returned to the MCP client (Claude), which performs the analysis.
 ANALYSIS_PROMPT_TEMPLATE = """You are an expert Insait platform bot debugger. Analyze the following bug report
 and provide:
 1. Root Cause — what specifically caused this bug at the flow/node/configuration level.
@@ -484,7 +499,7 @@ def _render_node_name(node_name) -> str:
     return node_name if node_name else "(unresolved)"
 
 
-async def _run_analysis(
+def _build_analysis_context(
     bug_description,
     merged_turns,
     system_prompt,
@@ -492,7 +507,10 @@ async def _run_analysis(
     flow_definition,
     knowledge,
 ) -> str:
-    """Step 7: compose the analysis prompt and call Opus 4.8."""
+    """Step 7: compose the analysis context string returned to the client.
+
+    No model call — the MCP client (Claude) performs the analysis.
+    """
     # Render unresolved node names as "(unresolved)" rather than a bare None.
     turns_for_prompt = [
         {**turn, "node_name": _render_node_name(turn.get("node_name"))}
@@ -500,7 +518,7 @@ async def _run_analysis(
         else turn
         for turn in merged_turns
     ]
-    prompt = ANALYSIS_PROMPT_TEMPLATE.format(
+    return ANALYSIS_PROMPT_TEMPLATE.format(
         bug_description=bug_description or "",
         merged_per_turn_data=_serialize(turns_for_prompt),
         system_prompt=system_prompt or "",
@@ -510,14 +528,6 @@ async def _run_analysis(
         claude_sessions_knowledge=knowledge.get("claude_sessions_knowledge", ""),
         golden_examples=knowledge.get("golden_examples", ""),
     )
-    client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-    response = await client.messages.create(
-        model=ANALYSIS_MODEL,
-        max_tokens=ANALYSIS_MAX_TOKENS,
-        thinking={"type": "adaptive"},
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return "".join(block.text for block in response.content if block.type == "text")
 
 
 # ---------------------------------------------------------------------------
@@ -609,12 +619,12 @@ def _write_bug_report(agent_id, agent_name, conversation_id, timestamp, report_i
 
 
 async def generate_bug_report(agent_id, bug_description, conversation_id):
-    """Orchestrates the bug-report data flow (section 5), with error handling
-    per section 8.
+    """Gather the data for a bug report and return it for the client to analyze
+    (section 5, steps 1-6), with error handling per section 8.
 
-    Steps: 1 validate inputs, 2 fetch agent, 3 fetch transcript, 4 fetch
-    interactions (paginated), 5 merge, 6 load knowledge, 7 Opus 4.8 analysis,
-    8 write report.
+    Does NOT call a model and does NOT write the report. It mints a report_id,
+    composes the analysis context (step 7 template), stores what save_bug_report
+    and save_dev_feedback will need, and returns the context to the client.
     """
     # Step 1: validate inputs — do not call any REST endpoint if one is missing.
     missing = _first_missing(
@@ -684,32 +694,76 @@ async def generate_bug_report(agent_id, bug_description, conversation_id):
     # Step 6: load local knowledge files.
     knowledge = _load_knowledge()
 
-    # Step 7: send everything to Opus 4.8 for analysis. Surface API errors
-    # clearly and never return a hallucinated/empty report.
-    try:
-        analysis = await _run_analysis(
-            bug_description,
-            merged_turns,
-            system_prompt,
-            security_prompt,
-            flow_definition,
-            knowledge,
-        )
-    except anthropic.APIError as exc:
-        return _error(
-            "Analysis failed — the Anthropic API returned an error: "
-            f"{exc}. No report was generated."
-        )
-    if not analysis or not analysis.strip():
-        return _error("The analysis came back empty. No report was generated.")
+    # Step 7: compose the analysis context (no model call — the client analyzes).
+    analysis_context = _build_analysis_context(
+        bug_description,
+        merged_turns,
+        system_prompt,
+        security_prompt,
+        flow_definition,
+        knowledge,
+    )
 
-    # Step 8: generate report_id, write the report, return a summary.
+    # Mint report_id and record what save_bug_report / save_dev_feedback will
+    # need. The report file is written later by save_bug_report.
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     report_id = f"{agent_id}_{timestamp}"
     transcript_message_count = len(_extract_transcript_messages(transcript))
     warnings = _pagination_warnings(len(interactions), transcript_message_count)
     if partial_warning:
         warnings.append(partial_warning)
+
+    REPORTS[report_id] = {
+        "agent_id": agent_id,
+        "agent_name": agent_name,
+        "conversation_id": conversation_id,
+        "timestamp": timestamp,
+        "bug_description": bug_description,
+        "warnings": warnings,
+        "analysis": None,
+        "root_cause": None,
+        "file_path": None,
+    }
+
+    return [
+        types.TextContent(
+            type="text",
+            text=(
+                f"report_id: {report_id}\n\n"
+                "Analyze the bug using the context below, then call "
+                "save_bug_report with this report_id and your analysis "
+                "(Root Cause, Solution A, and Solution B only if warranted).\n\n"
+                f"{analysis_context}"
+            ),
+        )
+    ]
+
+
+async def save_bug_report(report_id, analysis):
+    """Write the client-produced analysis to a report file (section 5, step 8).
+
+    Looks up the gathered context stored by generate_bug_report. Error handling
+    per section 8.
+    """
+    missing = _first_missing({"report_id": report_id, "analysis": analysis})
+    if missing:
+        return _error(
+            f"Missing required input: {missing}. Please provide it before I can "
+            "save this report."
+        )
+
+    report = REPORTS.get(report_id)
+    if report is None:
+        return _error(
+            f"Unknown report_id '{report_id}'. Run generate_bug_report in this "
+            "session first, then use the report_id it returned."
+        )
+
+    agent_id = report.get("agent_id", "")
+    agent_name = report.get("agent_name", "")
+    conversation_id = report.get("conversation_id", "")
+    timestamp = report.get("timestamp", datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+    warnings = report.get("warnings", [])
     root_cause = _extract_root_cause(analysis)
 
     # Attempt the local write; on failure, fall back to returning the report
@@ -723,17 +777,9 @@ async def generate_bug_report(agent_id, bug_description, conversation_id):
         save_error = exc
         file_path = None
 
-    # Record what save_dev_feedback needs, keyed by report_id.
-    REPORTS[report_id] = {
-        "agent_id": agent_id,
-        "agent_name": agent_name,
-        "conversation_id": conversation_id,
-        "timestamp": timestamp,
-        "bug_description": bug_description,
-        "analysis": analysis,
-        "root_cause": root_cause,
-        "file_path": file_path,
-    }
+    report["analysis"] = analysis
+    report["root_cause"] = root_cause
+    report["file_path"] = file_path
 
     if save_error is not None:
         content = _build_report_markdown(
@@ -752,7 +798,7 @@ async def generate_bug_report(agent_id, bug_description, conversation_id):
         types.TextContent(
             type="text",
             text=(
-                f"Report generated.\n"
+                f"Report saved.\n"
                 f"- report_id: {report_id}\n"
                 f"- path: {file_path}\n\n"
                 f"Root cause summary:\n{summary}"
@@ -917,6 +963,24 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="save_bug_report",
+            description=SAVE_BUG_REPORT_DESCRIPTION,
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "report_id": {
+                        "type": "string",
+                        "description": "The report_id returned by generate_bug_report in this session",
+                    },
+                    "analysis": {
+                        "type": "string",
+                        "description": "Your bug analysis: Root Cause, Solution A, and Solution B if warranted",
+                    },
+                },
+                "required": ["report_id", "analysis"],
+            },
+        ),
+        types.Tool(
             name="save_dev_feedback",
             description=SAVE_DEV_FEEDBACK_DESCRIPTION,
             inputSchema={
@@ -944,6 +1008,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             arguments.get("agent_id"),
             arguments.get("bug_description"),
             arguments.get("conversation_id"),
+        )
+    if name == "save_bug_report":
+        return await save_bug_report(
+            arguments.get("report_id"),
+            arguments.get("analysis"),
         )
     if name == "save_dev_feedback":
         return await save_dev_feedback(
