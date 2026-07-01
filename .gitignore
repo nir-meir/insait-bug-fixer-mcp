@@ -3,3 +3,6 @@
 
 # Generated bug reports (local output)
 reports/
+
+# Python virtual environment
+.venv/

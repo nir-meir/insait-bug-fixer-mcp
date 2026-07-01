@@ -7,10 +7,9 @@ PHASE 3: The three REST calls inside generate_bug_report (section 5, steps
 PHASE 4: Merge logic (section 5, step 5) + knowledge file loading (step 6).
 PHASE 5: Opus 4.8 analysis call (section 5, step 7).
 PHASE 6: Report writing (section 5, step 8) — report_id, folder, file write.
-
-Later phases fill in the rest:
-  PHASE 7 — save_dev_feedback
-  PHASE 8 — error handling
+PHASE 7: save_dev_feedback (section 5, step 9) — golden_examples append +
+         feedback file write.
+PHASE 8: Full error handling across all functions (section 8).
 """
 
 import asyncio
@@ -118,6 +117,19 @@ def _headers() -> dict:
     return {"X-API-Key": INSAIT_API_KEY or ""}
 
 
+def _error(message: str):
+    """Return a tool result carrying a clear error message to the chat."""
+    return [types.TextContent(type="text", text=message)]
+
+
+def _first_missing(fields: dict):
+    """Return the name of the first missing/blank required field, or None."""
+    for name, value in fields.items():
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return name
+    return None
+
+
 def _build_node_name_map(flow_definition) -> dict:
     """Build node_id -> human-readable node name map from flow_definition.
 
@@ -198,12 +210,17 @@ async def _fetch_interactions(conversation_id: str, organization_id, node_map: d
     Loops until a short or empty page is returned (accepted heuristic — no
     reliable has_more/total field). Resolves each interaction's node_id to a
     node name using the map from Step 2.
+
+    On a fetch error (e.g. timeout) the loop stops with whatever was collected
+    so far and a partial-data warning is returned instead of failing (step 4:
+    do not fail silently). Returns (interactions, partial_warning_or_None).
     """
     url = f"{INSAIT_BASE_URL}/api/v1/chat/conversations/{conversation_id}/interactions"
     interactions: list = []
     offset = 0
     page_size = None
     pages_fetched = 0
+    partial_warning = None
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
         while True:
             params = {
@@ -211,9 +228,17 @@ async def _fetch_interactions(conversation_id: str, organization_id, node_map: d
                 "offset": offset,
                 "include_debug": "true",
             }
-            response = await client.get(url, headers=_headers(), params=params)
-            response.raise_for_status()
-            page = _extract_interaction_list(response.json())
+            try:
+                response = await client.get(url, headers=_headers(), params=params)
+                response.raise_for_status()
+                page = _extract_interaction_list(response.json())
+            except (httpx.HTTPError, json.JSONDecodeError) as exc:
+                partial_warning = (
+                    f"Interactions fetch did not complete ({type(exc).__name__}); "
+                    "the report is based on partial execution-trace data."
+                )
+                break
+
             pages_fetched += 1
 
             if not page:
@@ -236,7 +261,7 @@ async def _fetch_interactions(conversation_id: str, organization_id, node_map: d
             if pages_fetched >= MAX_INTERACTION_PAGES:
                 break  # safety cap
 
-    return interactions
+    return interactions, partial_warning
 
 
 # ---------------------------------------------------------------------------
@@ -584,14 +609,44 @@ def _write_bug_report(agent_id, agent_name, conversation_id, timestamp, report_i
 
 
 async def generate_bug_report(agent_id, bug_description, conversation_id):
-    """Orchestrates the bug-report data flow (section 5).
+    """Orchestrates the bug-report data flow (section 5), with error handling
+    per section 8.
 
-    PHASE 3 implemented steps 2-4 (the three REST calls). PHASE 4 added steps
-    5-6 (merge + knowledge loading). PHASE 5 added step 7 (Opus 4.8 analysis).
-    PHASE 6 adds step 8 (report_id, folder creation, report file write).
+    Steps: 1 validate inputs, 2 fetch agent, 3 fetch transcript, 4 fetch
+    interactions (paginated), 5 merge, 6 load knowledge, 7 Opus 4.8 analysis,
+    8 write report.
     """
+    # Step 1: validate inputs — do not call any REST endpoint if one is missing.
+    missing = _first_missing(
+        {
+            "agent_id": agent_id,
+            "bug_description": bug_description,
+            "conversation_id": conversation_id,
+        }
+    )
+    if missing:
+        return _error(
+            f"Missing required input: {missing}. Please provide it before I can "
+            "analyze this bug."
+        )
+
     # Step 2: fetch agent data + derive node map and agent name.
-    agent_data = await _fetch_agent(agent_id)
+    try:
+        agent_data = await _fetch_agent(agent_id)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return _error("Agent ID not found. Please check the agent_id and try again.")
+        return _error(
+            "Failed to fetch agent data from the Insait platform "
+            f"(HTTP {exc.response.status_code})."
+        )
+    except httpx.TimeoutException:
+        return _error(
+            "Timed out fetching agent data from the Insait platform. Please try again."
+        )
+    except httpx.HTTPError as exc:
+        return _error(f"Failed to fetch agent data from the Insait platform: {exc}")
+
     system_prompt = agent_data.get("system_prompt") if isinstance(agent_data, dict) else None
     security_prompt = agent_data.get("security_prompt") if isinstance(agent_data, dict) else None
     flow_definition = agent_data.get("flow_definition") if isinstance(agent_data, dict) else None
@@ -600,10 +655,28 @@ async def generate_bug_report(agent_id, bug_description, conversation_id):
     agent_name = _extract_agent_name(agent_data, agent_id)
 
     # Step 3: fetch transcript (single call, no pagination).
-    transcript = await _fetch_transcript(conversation_id)
+    try:
+        transcript = await _fetch_transcript(conversation_id)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return _error(
+                "Conversation ID not found. Please check the conversation_id and "
+                "try again."
+            )
+        return _error(
+            "Failed to fetch the conversation transcript "
+            f"(HTTP {exc.response.status_code})."
+        )
+    except httpx.TimeoutException:
+        return _error("Timed out fetching the conversation transcript. Please try again.")
+    except httpx.HTTPError as exc:
+        return _error(f"Failed to fetch the conversation transcript: {exc}")
 
-    # Step 4: fetch interactions (paginated), resolving node names.
-    interactions = await _fetch_interactions(conversation_id, organization_id, node_map)
+    # Step 4: fetch interactions (paginated). On a fetch error, proceed with
+    # partial data and record a warning (do not fail silently).
+    interactions, partial_warning = await _fetch_interactions(
+        conversation_id, organization_id, node_map
+    )
 
     # Step 5: merge transcript + interactions into a per-turn structure.
     merged_turns = _merge_transcript_interactions(transcript, interactions)
@@ -611,27 +684,46 @@ async def generate_bug_report(agent_id, bug_description, conversation_id):
     # Step 6: load local knowledge files.
     knowledge = _load_knowledge()
 
-    # Step 7: send everything to Opus 4.8 for analysis.
-    analysis = await _run_analysis(
-        bug_description,
-        merged_turns,
-        system_prompt,
-        security_prompt,
-        flow_definition,
-        knowledge,
-    )
+    # Step 7: send everything to Opus 4.8 for analysis. Surface API errors
+    # clearly and never return a hallucinated/empty report.
+    try:
+        analysis = await _run_analysis(
+            bug_description,
+            merged_turns,
+            system_prompt,
+            security_prompt,
+            flow_definition,
+            knowledge,
+        )
+    except anthropic.APIError as exc:
+        return _error(
+            "Analysis failed — the Anthropic API returned an error: "
+            f"{exc}. No report was generated."
+        )
+    if not analysis or not analysis.strip():
+        return _error("The analysis came back empty. No report was generated.")
 
     # Step 8: generate report_id, write the report, return a summary.
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     report_id = f"{agent_id}_{timestamp}"
     transcript_message_count = len(_extract_transcript_messages(transcript))
     warnings = _pagination_warnings(len(interactions), transcript_message_count)
-    file_path = _write_bug_report(
-        agent_id, agent_name, conversation_id, timestamp, report_id, analysis, warnings
-    )
+    if partial_warning:
+        warnings.append(partial_warning)
     root_cause = _extract_root_cause(analysis)
 
-    # Record what save_dev_feedback (PHASE 7) will need, keyed by report_id.
+    # Attempt the local write; on failure, fall back to returning the report
+    # content directly (section 8).
+    save_error = None
+    try:
+        file_path = _write_bug_report(
+            agent_id, agent_name, conversation_id, timestamp, report_id, analysis, warnings
+        )
+    except OSError as exc:
+        save_error = exc
+        file_path = None
+
+    # Record what save_dev_feedback needs, keyed by report_id.
     REPORTS[report_id] = {
         "agent_id": agent_id,
         "agent_name": agent_name,
@@ -642,6 +734,15 @@ async def generate_bug_report(agent_id, bug_description, conversation_id):
         "root_cause": root_cause,
         "file_path": file_path,
     }
+
+    if save_error is not None:
+        content = _build_report_markdown(
+            agent_id, conversation_id, timestamp, report_id, analysis, warnings
+        )
+        return _error(
+            f"WARNING: could not save the report locally ({save_error}). "
+            f"report_id: {report_id}\n\nReport content follows:\n\n{content}"
+        )
 
     summary = root_cause.strip()
     if len(summary) > 300:
@@ -656,6 +757,105 @@ async def generate_bug_report(agent_id, bug_description, conversation_id):
                 f"- path: {file_path}\n\n"
                 f"Root cause summary:\n{summary}"
             ),
+        )
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Feedback — section 5, step 9
+# ---------------------------------------------------------------------------
+# Header used when golden_examples.md is auto-created on first feedback
+# (section 7.3).
+GOLDEN_EXAMPLES_HEADER = "# Golden Examples — Approved Corrections\n\n---\n"
+
+
+def _build_correction_block(
+    report_id, timestamp, agent_id, bug_description, original_root_cause, user_correction
+) -> str:
+    """Exact golden_examples append format (section 5, step 9)."""
+    return (
+        f"## [{report_id}] — [{timestamp}]\n"
+        f"**Agent:** {agent_id}\n"
+        f"**Bug description:** {bug_description}\n"
+        f"**Original root cause (wrong):** {original_root_cause}\n"
+        f"**Correct fix:** {user_correction}\n"
+        f"---\n"
+    )
+
+
+def _append_golden_example(block: str) -> None:
+    """Append a correction block to golden_examples.md, creating the file with
+    its header (section 7.3) if it does not exist yet."""
+    path = os.path.join(BUGFIXER_KB_DIR or "", "golden_examples.md")
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(GOLDEN_EXAMPLES_HEADER)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write("\n" + block)
+
+
+def _write_feedback_file(agent_name, timestamp, block: str) -> str:
+    """Write feedback_{timestamp}.md (same content) to the agent's output folder."""
+    folder = os.path.join(BUGFIXER_OUTPUT_DIR or "", _safe_folder_name(agent_name))
+    os.makedirs(folder, exist_ok=True)
+    file_path = os.path.join(folder, f"feedback_{timestamp}.md")
+    with open(file_path, "w", encoding="utf-8") as handle:
+        handle.write(block)
+    return file_path
+
+
+async def save_dev_feedback(report_id, user_correction):
+    """Step 9: append the developer's correction to golden_examples.md and
+    write a feedback record, with error handling per section 8.
+
+    Reads the original report context from the in-memory REPORTS registry
+    (populated by generate_bug_report).
+    """
+    # Validate inputs.
+    missing = _first_missing({"report_id": report_id, "user_correction": user_correction})
+    if missing:
+        return _error(
+            f"Missing required input: {missing}. Please provide it before I can "
+            "save this correction."
+        )
+
+    # The report must have been generated in this session.
+    report = REPORTS.get(report_id)
+    if report is None:
+        return _error(
+            f"Unknown report_id '{report_id}'. Run generate_bug_report in this "
+            "session first, then use the report_id it returned."
+        )
+
+    agent_id = report.get("agent_id", "")
+    agent_name = report.get("agent_name", "")
+    bug_description = report.get("bug_description", "")
+    original_root_cause = report.get("root_cause", "")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    block = _build_correction_block(
+        report_id, timestamp, agent_id, bug_description, original_root_cause, user_correction
+    )
+
+    # Attempt the local writes; on failure, return the correction content
+    # directly as a fallback (section 8).
+    save_error = None
+    try:
+        _append_golden_example(block)
+        _write_feedback_file(agent_name, timestamp, block)
+    except OSError as exc:
+        save_error = exc
+
+    if save_error is not None:
+        return _error(
+            f"WARNING: could not save the feedback locally ({save_error}). "
+            f"Correction content follows:\n\n{block}"
+        )
+
+    return [
+        types.TextContent(
+            type="text",
+            text="Correction saved. It will be included as a reference in future bug analyses.",
         )
     ]
 
@@ -745,9 +945,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
             arguments.get("bug_description"),
             arguments.get("conversation_id"),
         )
-    # PHASE 2: save_dev_feedback is registered but not yet implemented (PHASE 7).
     if name == "save_dev_feedback":
-        return [types.TextContent(type="text", text="save_dev_feedback is not yet implemented.")]
+        return await save_dev_feedback(
+            arguments.get("report_id"),
+            arguments.get("user_correction"),
+        )
     raise ValueError(f"Unknown tool: {name}")
 
 
