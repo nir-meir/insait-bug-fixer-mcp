@@ -10,3 +10,7 @@ reports/
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+# macOS Finder metadata
+.DS_Store
+**/.DS_Store
