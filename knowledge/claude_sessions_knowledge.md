@@ -243,6 +243,24 @@ break before it.
 
 ---
 
+### 2.15 One speaker per turn: silence a routing node's completion reply
+`Tags: merged-messages, double-question, one-bubble, whatsapp-merge, completion-reply, silent-handoff, node-chaining, multi-node-turn`
+
+**Principle:** When a node saves a value and immediately chains to another node in the same turn, both nodes' outputs leave as one turn — and the WhatsApp delivery layer glues them with no separator (unreadable single bubble; the platform's own `\n` join between `node_content_segments` does not reach the channel). The fix is to make only ONE node speak in that turn: the routing node saves silently, the destination node asks its question. Scope the rule to the specific node — a global version misfires on multi-field collect nodes, where "save field 1 → ask for field 2" is correct behavior, and the global system prompt only reaches `use_agent_prompt:true` nodes anyway (~half the flow).
+
+**Verified instance:** On the customer's "אכן" turn, `Present Policy Details` saved the email-update intent, emitted its own question, then chained to `Change Email` which asked a second question — both glued in one WhatsApp bubble. Verified fix (user-tested on a real device, 2026-07-02): the node-scoped rule below WITH `skip_collect_completion_response: true` also set. Attribution not isolated — no test was run with the toggle alone, so treat the combination as the verified unit; if a future case wants the deterministic toggle only, test that in isolation first.
+
+**Shipped fix (verbatim, appended to the routing node's prompt):**
+```
+CRITICAL — SILENT HANDOFF: When you save a value that routes the conversation to
+another step (for example: the customer confirms they want to update their email),
+do NOT ask the next question yourself and do NOT add any question to your reply —
+the next step in the flow asks it. End your reply with no question.
+```
+The general class (any legitimate multi-node turn still merges) is only fixed at the delivery layer — platform must send each `node_content_segment` as its own WhatsApp message.
+
+---
+
 ## Part 3 — Platform Behaviors (verified; re-check after platform releases)
 
 `Tags: always`
