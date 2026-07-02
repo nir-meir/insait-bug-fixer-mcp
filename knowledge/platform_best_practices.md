@@ -1,10 +1,14 @@
 # Insait Agent Builder — Working Guide
 
+`Tags: always`
+
 The Agent Builder is the visual graph editor of the Insait platform. An agent's entire behavior is one JSON document — an **`AgentFlow`** — stored in the `agents.flow_definition` JSONB column. The same document drives both the editor canvas and the runtime engine (`FlowOrchestrator`): nodes are vertices, **exits** are directed edges with conditions, and **variables** are the shared mutable state. Debugging an agent = debugging this document plus the deterministic rules below for how the orchestrator walks it. Everything in this guide was read from the platform source (paths cited as provenance only; all rules are stated inline).
 
 ---
 
 ## The Flow Data Model
+
+`Tags: flow-schema, agent-flow, global-settings, greeting, system-prompt, history-limit, persistence, flow-version, publish, draft, export-import, concurrency-conflict, sdk`
 
 **Top-level `AgentFlow`** (`backend/app/schemas/flow/agent_flow.py`). Required fields are marked ✱.
 
@@ -91,6 +95,8 @@ The Agent Builder is the visual graph editor of the Insait platform. An agent's 
 ---
 
 ## Node Types
+
+`Tags: node-types, start-node, greeting, router-mode, conversation-node, collect-node, api-node, code-node, python-sandbox, set-variables, end-node, transfer-to-human, sip-transfer, working-hours, node-config, llm-override, real-time-assistant`
 
 Discriminated union on `type` (`backend/app/schemas/flow/nodes.py`). Every node has: `id`, `type`, `name` (display, ≤100), `data` (type-specific), `exits: Exit[]`, `position {x,y}` (editor only). 15 types total; 9 conversational + 6 real-time-assistant (separate engine).
 
@@ -196,6 +202,8 @@ Discriminated union on `type` (`backend/app/schemas/flow/nodes.py`). Every node 
 
 ## Exits & Conditions
 
+`Tags: exits, edges, routing, transitions, condition-types, expression-grammar, priority, evaluation-order, pre-node, post-node, llm-exit, result-exit, always-exit, stuck-node, wrong-branch, dead-edge`
+
 **`Exit` object** (`backend/app/schemas/flow/exits.py`):
 
 | Field | Constraint |
@@ -281,6 +289,8 @@ Every evaluation appends a `ConditionEvaluationRecord` to `turn.processing.condi
 
 ## Variables
 
+`Tags: variables, variable-types, enum-options, default-values, templating, interpolation, system-variables, type-coercion, unset-vs-empty, none-vs-empty-string, session-data, reserved-names, sensitive-data`
+
 **Types** (`VariableType`): `string`, `number`, `boolean`, `date`, `enum`, `list`, `object`, `document`, `array` (legacy alias of list).
 
 **`VariableDefinition` fields**: `name` ✱ (regex `^[a-z][a-z0-9_]*$`), `type` ✱, `default`, `description` (≤500), `required` (true), `persist` (true), `source` (`user`\|`collect`\|`tool`\|`system`\|`session`), `source_node_id` (which collect node owns it), `collection_mode` (`explicit` = must ask the user directly \| `deducible` = may extract from context; default `explicit`), `validation_rules`, `options` (enum), `allowed_file_types`/`max_file_size_mb` (document; ≤30 MB; default extensions pdf, doc, docx, txt, png, jpg, jpeg, webp[, csv, xlsx]), `sensitive` (encrypt at rest; masked as `<SENSITIVE>` in logs).
@@ -310,6 +320,8 @@ Every evaluation appends a `ConditionEvaluationRecord` to `turn.processing.condi
 ---
 
 ## Collect Nodes & Validation
+
+`Tags: collect-node, field-collection, save-fields, extraction, validation-rules, builtin-validators, confirmation, re-ask-loop, validation-loop, retry-counter, dtmf, interactive-form, document-upload`
 
 **Extraction model.** One unified LLM call per collection turn: the LLM receives all field definitions + per-field status + history, and persists values by calling the internal **`save_fields`** tool. The tool loop within a single turn is capped at **`MAX_COLLECT_TOOL_ITERATIONS = 5`**. Per-field state lives in `state.graph_state.collect_state[node_id][field_name]` as `{collected, confirmed, value, set_at_turn}` and persists across turns (partial collection). A field's value is copied into `state.variables` **only when `confirmed == true` and value is not None**.
 
@@ -367,6 +379,8 @@ Every evaluation appends a `ConditionEvaluationRecord` to `turn.processing.condi
 
 ## Tools & Knowledge Bases
 
+`Tags: tools, built-in-tools, custom-tools, goto-node, end-call, kb-mode, rag, retrieval, knowledge-base, reranking, hybrid-search, fast-reply, trigger-message, tool-ack, chunks`
+
 **Built-in tools** (`tools.built_in_tools`, defaults): `end_call` **true**; `transfer_to_human`, `schedule_appointment`, `goto_node`, `show_confirmation`, `extract_from_document`, `save_fields`, `suggestion_buttons` all **false**. Related config on `ToolsConfig`: `global_tools` (custom tool IDs available across nodes), `end_call_trigger_message`, `transfer_trigger_message`, `goto_node_jumps` (`[{id, name, target_node_id, description, fast_reply_text}]`), `goto_node_fast_reply_mode` (`auto`), `tool_ack_mode_enabled` (false — INS-2930; when ON, per-tool `*_fast_reply_mode` fields are ignored in favor of a global tool-ack preamble + deterministic predefined messages), `save_fields_trigger_message`, `tool_ack_preamble`, `send_sms` config.
 
 **Per-node tool config** (`NodeToolConfig` inside `data.tools`): `tool_id` ✱, `trigger_message` (≤500, fast reply on invocation), `fast_reply_mode` (`auto`\|`predefined`\|`off`, None = inherit), `goto_node_jump_ids` (restrict which jumps this node offers), `config` (tool-specific: `show_confirmation.field_names`, `extract_from_document.{extraction_prompt, vision_model, field_names, document_field, max_pages}`, `save_fields.field_names`).
@@ -384,6 +398,8 @@ Every evaluation appends a `ConditionEvaluationRecord` to `turn.processing.condi
 ---
 
 ## Runtime Execution Model
+
+`Tags: orchestrator, execution-model, node-chaining, chain-depth, turn-state, conversation-state, streaming, start-trigger, error-handling, loop-protection, turn-forensics, timing`
 
 (`backend/app/services/orchestrator/flow_orchestrator.py`.)
 
@@ -422,6 +438,8 @@ user message (or "__start__")
 
 ## Flow Validation Rules
 
+`Tags: validation, save-errors, frontend-validation, pydantic, flow-load-failure, self-healing, silent-degradation, unvalidated-gaps`
+
 **Backend (hard — Pydantic parse fails, flow can't be saved/loaded)** (`schemas/flow/*`):
 - `flow.nodes` empty; `start_node_id` not in `nodes`.
 - `channel:"voice"` with `voice_settings:null`.
@@ -446,6 +464,8 @@ user message (or "__start__")
 
 ## Best Practices
 
+`Tags: always`
+
 - **Every routing node gets exactly one `always` fallback exit**, listed last. Expression exits get distinct, explicit priorities (0,1,2,…); reserve 99 for the fallback (SDK convention).
 - **Route on variables, not vibes**: prefer `expression` exits on collected/saved variables over `llm` exits; `llm` exits cost an LLM decision, and on api/function/code nodes they silently become unconditional.
 - **On conversation nodes, any variable you want to route on the same turn must be written via `save_fields`** (enable the built-in tool and reference the field) — otherwise the expression exit can only fire on the *next* turn's pre-node check.
@@ -461,6 +481,8 @@ user message (or "__start__")
 ---
 
 ## Known Quirks & Common Bug Patterns
+
+`Tags: symptom-table, quirks, stuck-node, repeats-itself, wrong-exit, routing-bugs, collect-bugs, re-ask-loop, kb-bugs, transfer-bugs, enum-mismatch, literal-placeholder, dead-end, chain-depth, 409-conflict, greeting-bugs`
 
 | Symptom | Likely root cause | Where to look | Fix |
 |---|---|---|---|
@@ -495,6 +517,8 @@ user message (or "__start__")
 
 ## Debugging Checklist
 
+`Tags: always`
+
 When a flow misbehaves, work through this order (each step names the artifact to inspect):
 
 1. **Load the flow JSON** (`agents.flow_definition` or the published version snapshot). Confirm which one the conversation actually ran — draft vs published (`published_version_id`), and `flow_version` at the time.
@@ -512,6 +536,8 @@ When a flow misbehaves, work through this order (each step names the artifact to
 ---
 
 ## Source Map
+
+`Tags: source-map, provenance, platform-source-files, codebase-paths`
 
 Provenance only — the guide stands alone without these files.
 

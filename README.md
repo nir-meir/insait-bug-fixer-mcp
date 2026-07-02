@@ -21,6 +21,9 @@ Claude reads that context, produces the **Root Cause + Solution(s)**, and saves 
 | `generate_bug_report` | Validates the 3 inputs, fetches agent/transcript/interactions + knowledge, returns a `report_id` + context. **Does not analyze.** |
 | `save_bug_report` | Writes Claude's analysis (Root Cause / Solution A / Solution B) to a Markdown report file. |
 | `save_dev_feedback` | Appends a developer's correction to `golden_examples.md` so future reports learn from it. |
+| `get_knowledge` | Fetches knowledge sections on demand by section title or tag. The analysis context inlines only the `always`-tagged core + the sections whose tags match the bug; everything else is listed in a knowledge index and fetched with this tool. |
+
+**Knowledge sectioning:** the `.md` files under `BUGFIXER_KB_DIR` are split into sections at any heading followed by a `` `Tags: a, b, c` `` line. Tag a section `always` to inline it into every context; give it descriptive failure-shape tags to make it auto-attach when a bug description matches. Untagged headings stay inside their parent section.
 
 Typical flow: **gather → analyze (Claude) → save → (optional) correct.**
 

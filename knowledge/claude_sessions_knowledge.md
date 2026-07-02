@@ -1,5 +1,7 @@
 # Claude Sessions Knowledge — Field-Verified Bug Patterns
 
+`Tags: always`
+
 **Provenance:** Distilled from real Insait agent-flow debugging sessions, then **verified against the live UAT config export** (`passportcard_support_agent___uat___whatsapp` agent JSON + KB, export dated 2026-07-01). Every entry here describes a fix that is **confirmed present in the shipped config** (or explicitly user-confirmed working). Hypotheses, unapplied proposals, and unverified claims are deliberately excluded — see `~/Desktop/flow_bug_cases.md` for the full case list with per-case verification verdicts.
 
 **How to use this file (instructions to the consuming model):**
@@ -12,6 +14,8 @@
 ---
 
 ## Part 1 — Investigation Playbook (proven method, in order)
+
+`Tags: always`
 
 | Step | Rule | Why it earned its place |
 |---|---|---|
@@ -150,7 +154,7 @@ rules above, without inserting a clarifying question.
 ---
 
 ### 2.8 Force KB retrieval for facts the model loves to invent; forbid inventing them
-`Tags: hallucinated-contact-info, kb-trigger, never-invent, rag-grounding, tool-mode-kb`
+`Tags: hallucinated-contact-info, invented-phone-number, invented-hours, hallucination, kb-trigger, never-invent, rag-grounding, tool-mode-kb`
 
 **Principle:** Contact info (phones, hours, URLs) is a top hallucination target. Two verified layers: (1) an explicit **must-retrieve + use-only-returned-values + never-invent** rule so the worst case is "not available," never a fabricated number; (2) where the KB was in `tool` mode (LLM decides whether to query), switching to `auto` mode removes the "model skipped the lookup" failure class entirely.
 
@@ -241,6 +245,8 @@ break before it.
 
 ## Part 3 — Platform Behaviors (verified; re-check after platform releases)
 
+`Tags: always`
+
 *As of 2026-07 (UAT export + in-session codebase reads):*
 
 | Behavior | Detail |
@@ -256,6 +262,8 @@ break before it.
 ---
 
 ## Part 4 — Template for new entries
+
+`Tags: contribution-template, adding-knowledge, knowledge-maintenance`
 
 Add new knowledge ONLY after verifying the fix exists in a fresh config export (or the user confirms it live). One entry per *pattern* — if a new case matches an existing pattern, append it as another verified instance instead of a new section.
 
