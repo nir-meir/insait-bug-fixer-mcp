@@ -826,6 +826,14 @@ def _write_bug_report(agent_id, agent_name, conversation_id, timestamp, report_i
     return file_path
 
 
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate without a tokenizer dependency: ~4 chars per token
+    for ASCII (English/JSON), ~1 char per token for non-ASCII (e.g. Hebrew)."""
+    ascii_chars = sum(1 for char in text if ord(char) < 128)
+    non_ascii_chars = len(text) - ascii_chars
+    return max(1, round(ascii_chars / 4) + non_ascii_chars)
+
+
 def _write_gather_context(agent_name, timestamp, text) -> str:
     """Always persist the full gather context (exactly what is handed to the MCP
     client) to a local file, so it is inspectable on every run. Local write
@@ -833,8 +841,9 @@ def _write_gather_context(agent_name, timestamp, text) -> str:
     folder = os.path.join(BUGFIXER_OUTPUT_DIR or "", _safe_folder_name(agent_name))
     os.makedirs(folder, exist_ok=True)
     file_path = os.path.join(folder, f"gather_context_{timestamp}.txt")
+    header = f"[Estimated tokens in this file: {_estimate_tokens(text)}]\n\n"
     with open(file_path, "w", encoding="utf-8") as handle:
-        handle.write(text)
+        handle.write(header + text)
     return file_path
 
 
