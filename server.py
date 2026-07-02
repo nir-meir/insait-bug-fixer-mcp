@@ -9,6 +9,13 @@ Tools:
                          return the analysis context + a report_id.
   save_bug_report      — write the client-produced analysis to a report file.
   save_dev_feedback    — append a developer correction to golden_examples.md.
+  get_knowledge        — fetch knowledge sections on demand (by title or tag).
+
+Knowledge injection: the knowledge .md files are split into sections at any
+heading followed by a `Tags:` line. Sections tagged `always` are inlined into
+every analysis context; the rest appear as an index (title + tags) and are
+auto-attached only when their tags lexically match the bug description —
+anything else is fetchable via get_knowledge.
 
 The Insait REST data flow (section 5, steps 2-6), report format (step 8), and
 golden_examples format (step 9) are unchanged; the Opus 4.8 call (step 7) is
@@ -64,10 +71,13 @@ missing — ask for them one at a time if needed:
 
 Once you have all three, call generate_bug_report. It does not analyze the bug
 itself — it returns a report_id and a context block (conversation trace, agent
-configuration, and knowledge base). YOU perform the analysis: read that context
+configuration, and knowledge). YOU perform the analysis: read that context
 and produce the Root Cause, Solution A, and (only if genuinely different and
-valuable) Solution B, following the instructions in the returned context. Then
-call save_bug_report with that report_id and your analysis text to write the
+valuable) Solution B, following the instructions in the returned context. The
+context inlines the core knowledge plus the sections that matched this bug,
+and a KNOWLEDGE INDEX of everything else — call get_knowledge for any indexed
+section whose tags match the failure shape you are investigating. Then call
+save_bug_report with that report_id and your analysis text to write the
 report.
 
 After the report is saved, stay in the session. If the developer tells you the
@@ -106,6 +116,14 @@ SAVE_BUG_REPORT_DESCRIPTION = (
     "Call this after generate_bug_report, once you have produced the analysis (Root Cause, Solution A, and Solution B if warranted) from the context that generate_bug_report returned.\n"
     "\n"
     "Requires the report_id returned by generate_bug_report in this session and your analysis text. On success, returns the report_id and the path where the report was saved. Keep the report_id — it is needed if the developer wants to submit a correction via save_dev_feedback."
+)
+
+GET_KNOWLEDGE_DESCRIPTION = (
+    "Fetches local knowledge sections (platform guide sections, verified bug patterns) by section title or by tag.\n"
+    "\n"
+    "The context returned by generate_bug_report contains a KNOWLEDGE INDEX listing every available section with its tags. Sections whose tags matched the bug are already attached to that context — call this tool for any OTHER section the index shows is relevant to the bug you are analyzing (e.g. its tags match the failure shape you are now suspecting).\n"
+    "\n"
+    "Provide `sections` (exact or partial section titles) and/or `tags` (exact tag strings from the index). Returns the full text of every matching section. Can be called at any time, including before generate_bug_report."
 )
 
 SAVE_DEV_FEEDBACK_DESCRIPTION = (
@@ -428,23 +446,158 @@ def _read_kb_file(path, missing_ok=False):
         return handle.read()
 
 
-def _load_knowledge():
-    """Step 6: read the three local knowledge files (full content).
+# ---------------------------------------------------------------------------
+# Knowledge sectioning, index, and auto-match
+# ---------------------------------------------------------------------------
+# A knowledge section starts at a markdown heading (#/##/###) that is followed,
+# within the next 3 non-empty lines, by a `Tags: a, b, c` line (backticks/bold
+# around it are tolerated). Untagged headings and their content belong to the
+# enclosing tagged section — so section granularity is controlled from the .md
+# files themselves, not from code. The special tag `always` marks a section as
+# inlined into every analysis context; all other sections are index+on-demand.
+KNOWLEDGE_HEADING_RE = re.compile(r"^(#{1,3})\s+(.+?)\s*$")
+KNOWLEDGE_TAGS_RE = re.compile(r"^[*_`\s]*Tags:\s*(.+?)[*_`\s]*$", re.IGNORECASE)
 
-    golden_examples.md may not exist yet — inject an empty string silently.
+# Auto-match scoring: a full tag phrase found in the bug description scores 3,
+# each distinct tag token found scores 1. Sections at or above MIN_SCORE are
+# attached (top MAX_SECTIONS by score). Tokens shorter than MIN_TOKEN_LEN are
+# ignored so generic words ("node", "bug") don't match everything.
+KNOWLEDGE_MATCH_MIN_SCORE = 2
+KNOWLEDGE_MATCH_MAX_SECTIONS = 5
+KNOWLEDGE_MATCH_MIN_TOKEN_LEN = 4
+
+
+def _norm_token(word: str) -> str:
+    """Fold trivial plurals so 'links' matches 'link', 'breaks' matches
+    'break'. Both sides of the comparison are normalized identically."""
+    return word[:-1] if word.endswith("s") and len(word) > KNOWLEDGE_MATCH_MIN_TOKEN_LEN else word
+
+
+def _parse_knowledge_sections(file_label: str, text: str) -> list:
+    """Split a knowledge markdown file into tagged, addressable sections.
+
+    Returns a list of {"file", "title", "tags", "content"} dicts, in file
+    order. Content before the first tagged heading is dropped (tag the top
+    heading `always` to keep a file preamble).
+    """
+    lines = text.split("\n")
+    sections: list = []
+    current = None
+    in_code_fence = False
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith("```"):
+            in_code_fence = not in_code_fence
+        heading = KNOWLEDGE_HEADING_RE.match(line)
+        if heading and not in_code_fence:
+            tags = None
+            non_empty_seen = 0
+            for lookahead in lines[i + 1 : i + 8]:
+                stripped = lookahead.strip()
+                if not stripped:
+                    continue
+                # a new heading ends the lookahead — tags belong to the
+                # nearest heading above them, never through another heading
+                if KNOWLEDGE_HEADING_RE.match(stripped):
+                    break
+                tag_match = KNOWLEDGE_TAGS_RE.match(stripped)
+                if tag_match:
+                    tags = [
+                        t.strip().lower()
+                        for t in tag_match.group(1).split(",")
+                        if t.strip()
+                    ]
+                    break
+                non_empty_seen += 1
+                if non_empty_seen >= 3:
+                    break
+            if tags is not None:
+                if current is not None:
+                    sections.append(current)
+                current = {
+                    "file": file_label,
+                    "title": heading.group(2),
+                    "tags": tags,
+                    "content_lines": [line],
+                }
+                continue
+        if current is not None:
+            current["content_lines"].append(line)
+    if current is not None:
+        sections.append(current)
+    for section in sections:
+        section["content"] = "\n".join(section.pop("content_lines")).strip()
+    return sections
+
+
+def _load_knowledge_sections():
+    """Step 6: read the knowledge files as sections + golden examples text.
+
+    Files are re-read on every call (they are small) so knowledge edits take
+    effect without a server restart. golden_examples.md stays fully inlined:
+    it holds approved corrections and is kept short by periodic distillation
+    into the pattern files.
     """
     kb_dir = BUGFIXER_KB_DIR or ""
-    return {
-        "claude_sessions_knowledge": _read_kb_file(
-            os.path.join(kb_dir, KNOWLEDGE_FILES["claude_sessions_knowledge"])
-        ),
-        "platform_best_practices": _read_kb_file(
-            os.path.join(kb_dir, KNOWLEDGE_FILES["platform_best_practices"])
-        ),
-        "golden_examples": _read_kb_file(
-            os.path.join(kb_dir, KNOWLEDGE_FILES["golden_examples"]), missing_ok=True
-        ),
-    }
+    sections: list = []
+    for label in ("claude_sessions_knowledge", "platform_best_practices"):
+        text = _read_kb_file(
+            os.path.join(kb_dir, KNOWLEDGE_FILES[label]), missing_ok=True
+        )
+        sections.extend(_parse_knowledge_sections(label, text))
+    golden = _read_kb_file(
+        os.path.join(kb_dir, KNOWLEDGE_FILES["golden_examples"]), missing_ok=True
+    )
+    return sections, golden
+
+
+def _match_knowledge_sections(sections: list, query_text: str) -> list:
+    """Deterministic lexical auto-match of sections against the bug text.
+
+    No embeddings, no LLM — the match is inspectable: score = 3 per full tag
+    phrase present in the query + 1 per distinct tag token present.
+    `always` sections are excluded (they are inlined separately).
+    """
+    query = re.sub(r"[^a-z0-9א-ת ]", " ", (query_text or "").lower())
+    query_words = {_norm_token(w) for w in query.split()}
+    scored = []
+    for section in sections:
+        if "always" in section["tags"]:
+            continue
+        score = 0
+        seen_tokens: set = set()
+        for tag in section["tags"]:
+            phrase = tag.replace("-", " ")
+            if len(phrase) >= KNOWLEDGE_MATCH_MIN_TOKEN_LEN and phrase in query:
+                score += 3
+            for token in phrase.split():
+                token = _norm_token(token)
+                if (
+                    len(token) >= KNOWLEDGE_MATCH_MIN_TOKEN_LEN
+                    and token not in seen_tokens
+                    and token in query_words
+                ):
+                    seen_tokens.add(token)
+                    score += 1
+        if score >= KNOWLEDGE_MATCH_MIN_SCORE:
+            scored.append((score, section))
+    scored.sort(key=lambda item: -item[0])
+    return [section for _, section in scored[:KNOWLEDGE_MATCH_MAX_SECTIONS]]
+
+
+def _render_knowledge_sections(sections: list) -> str:
+    return "\n\n".join(f"[{s['file']}]\n{s['content']}" for s in sections)
+
+
+def _build_knowledge_index(sections: list, attached_titles: set) -> str:
+    """One line per on-demand section: title, tags, and whether it is already
+    attached to this context."""
+    lines = []
+    for section in sections:
+        if "always" in section["tags"]:
+            continue
+        mark = "  [attached below]" if section["title"] in attached_titles else ""
+        lines.append(f"- {section['title']}  (tags: {', '.join(section['tags'])}){mark}")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -478,11 +631,18 @@ tool configurations). Do not suggest backend/infrastructure fixes.
 --- FLOW DEFINITION (node structure) ---
 {flow_definition_summary}
 
---- PLATFORM BEST PRACTICES ---
-{platform_best_practices}
+--- CORE KNOWLEDGE (always applicable) ---
+{knowledge_always}
 
---- PAST SESSION KNOWLEDGE ---
-{claude_sessions_knowledge}
+--- KNOWLEDGE INDEX ---
+These additional knowledge sections exist locally. The ones whose tags matched
+this bug are auto-attached below (marked). Before finalizing your analysis,
+scan this index: if any OTHER section's tags match this bug's failure shape,
+call get_knowledge (by section title or tags) and read it first.
+{knowledge_index}
+
+--- KNOWLEDGE MATCHED TO THIS BUG (auto-attached) ---
+{knowledge_matched}
 
 --- APPROVED GOLDEN EXAMPLES ---
 {golden_examples}"""
@@ -532,8 +692,9 @@ def _build_analysis_context(
         system_prompt=system_prompt or "",
         security_prompt=security_prompt or "",
         flow_definition_summary=_serialize(flow_for_prompt),
-        platform_best_practices=knowledge.get("platform_best_practices", ""),
-        claude_sessions_knowledge=knowledge.get("claude_sessions_knowledge", ""),
+        knowledge_always=knowledge.get("always", ""),
+        knowledge_index=knowledge.get("index", ""),
+        knowledge_matched=knowledge.get("matched", "(none matched — check the index)"),
         golden_examples=knowledge.get("golden_examples", ""),
     )
 
@@ -665,6 +826,14 @@ def _write_bug_report(agent_id, agent_name, conversation_id, timestamp, report_i
     return file_path
 
 
+def _estimate_tokens(text: str) -> int:
+    """Rough token estimate without a tokenizer dependency: ~4 chars per token
+    for ASCII (English/JSON), ~1 char per token for non-ASCII (e.g. Hebrew)."""
+    ascii_chars = sum(1 for char in text if ord(char) < 128)
+    non_ascii_chars = len(text) - ascii_chars
+    return max(1, round(ascii_chars / 4) + non_ascii_chars)
+
+
 def _write_gather_context(agent_name, timestamp, text) -> str:
     """Always persist the full gather context (exactly what is handed to the MCP
     client) to a local file, so it is inspectable on every run. Local write
@@ -672,8 +841,9 @@ def _write_gather_context(agent_name, timestamp, text) -> str:
     folder = os.path.join(BUGFIXER_OUTPUT_DIR or "", _safe_folder_name(agent_name))
     os.makedirs(folder, exist_ok=True)
     file_path = os.path.join(folder, f"gather_context_{timestamp}.txt")
+    header = f"[Estimated tokens in this file: {_estimate_tokens(text)}]\n\n"
     with open(file_path, "w", encoding="utf-8") as handle:
-        handle.write(text)
+        handle.write(header + text)
     return file_path
 
 
@@ -750,8 +920,20 @@ async def generate_bug_report(agent_id, bug_description, conversation_id):
     # Step 5: build a complete conversation record (transcript + execution trace).
     merged = _merge_transcript_interactions(transcript, interactions)
 
-    # Step 6: load local knowledge files.
-    knowledge = _load_knowledge()
+    # Step 6: load knowledge as sections; inline the `always` layer, auto-match
+    # the rest against the bug description, and index everything else for
+    # on-demand retrieval via get_knowledge.
+    sections, golden = _load_knowledge_sections()
+    always_sections = [s for s in sections if "always" in s["tags"]]
+    matched_sections = _match_knowledge_sections(sections, bug_description)
+    knowledge = {
+        "always": _render_knowledge_sections(always_sections),
+        "index": _build_knowledge_index(
+            sections, {s["title"] for s in matched_sections}
+        ),
+        "matched": _render_knowledge_sections(matched_sections),
+        "golden_examples": golden,
+    }
 
     # Trim the flow to the nodes this conversation touched (+ their neighbors).
     touched_ids = [
@@ -902,6 +1084,52 @@ async def save_bug_report(report_id, analysis):
                 f"Root cause summary:\n{summary}"
             ),
         )
+    ]
+
+
+# ---------------------------------------------------------------------------
+# get_knowledge — on-demand knowledge section retrieval
+# ---------------------------------------------------------------------------
+async def get_knowledge(section_queries, tag_queries):
+    """Return the full text of knowledge sections matching the given titles
+    (exact or substring, case-insensitive) and/or exact tags."""
+    wanted_titles = [
+        q.strip().lower()
+        for q in (section_queries or [])
+        if isinstance(q, str) and q.strip()
+    ]
+    wanted_tags = [
+        q.strip().lower()
+        for q in (tag_queries or [])
+        if isinstance(q, str) and q.strip()
+    ]
+    if not wanted_titles and not wanted_tags:
+        return _error(
+            "Provide at least one of: sections (section titles) or tags. "
+            "See the KNOWLEDGE INDEX in the generate_bug_report context for "
+            "available sections and their tags."
+        )
+
+    sections, _ = _load_knowledge_sections()
+    picked = []
+    for section in sections:
+        title_lower = section["title"].lower()
+        title_hit = any(w in title_lower for w in wanted_titles)
+        tag_hit = any(t in section["tags"] for t in wanted_tags)
+        if title_hit or tag_hit:
+            picked.append(section)
+
+    if not picked:
+        available = "\n".join(
+            f"- {s['title']}  (tags: {', '.join(s['tags'])})" for s in sections
+        )
+        return _error(
+            "No knowledge section matched those titles/tags. Available sections:\n"
+            + available
+        )
+
+    return [
+        types.TextContent(type="text", text=_render_knowledge_sections(picked))
     ]
 
 
@@ -1079,6 +1307,25 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="get_knowledge",
+            description=GET_KNOWLEDGE_DESCRIPTION,
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "sections": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Section titles to fetch (exact or partial, case-insensitive), as listed in the KNOWLEDGE INDEX",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Exact tag strings to fetch sections by, as listed in the KNOWLEDGE INDEX",
+                    },
+                },
+            },
+        ),
+        types.Tool(
             name="save_dev_feedback",
             description=SAVE_DEV_FEEDBACK_DESCRIPTION,
             inputSchema={
@@ -1111,6 +1358,11 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
         return await save_bug_report(
             arguments.get("report_id"),
             arguments.get("analysis"),
+        )
+    if name == "get_knowledge":
+        return await get_knowledge(
+            arguments.get("sections"),
+            arguments.get("tags"),
         )
     if name == "save_dev_feedback":
         return await save_dev_feedback(

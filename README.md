@@ -14,13 +14,18 @@ Claude reads that context, produces the **Root Cause + Solution(s)**, and saves 
 
 > Scope: UI / flow / node configuration only. Backend and infrastructure bugs are out of scope — the tool will tell you to escalate those.
 
-## The three tools
+## Tools
 
 | Tool | What it does |
 |------|--------------|
 | `generate_bug_report` | Validates the 3 inputs, fetches agent/transcript/interactions + knowledge, returns a `report_id` + context. **Does not analyze.** |
 | `save_bug_report` | Writes Claude's analysis (Root Cause / Solution A / Solution B) to a Markdown report file. |
 | `save_dev_feedback` | Appends a developer's correction to `golden_examples.md` so future reports learn from it. |
+| `get_knowledge` | Fetches knowledge sections on demand by section title or tag. The analysis context inlines only the `always`-tagged core + the sections whose tags match the bug; everything else is listed in a knowledge index and fetched with this tool. |
+
+**Knowledge sectioning:** the `.md` files under `BUGFIXER_KB_DIR` are split into sections at any heading followed by a `` `Tags: a, b, c` `` line. Tag a section `always` to inline it into every context; give it descriptive failure-shape tags to make it auto-attach when a bug description matches. Untagged headings stay inside their parent section.
+
+The server also exposes one MCP prompt, `bug_fixer_instructions`, with session-start instructions for the assistant.
 
 Typical flow: **gather → analyze (Claude) → save → (optional) correct.**
 
@@ -35,7 +40,7 @@ Typical flow: **gather → analyze (Claude) → save → (optional) correct.**
 2. Create a `.env` file next to `server.py`:
    ```
    INSAIT_API_KEY=<your Insait API key>
-   INSAIT_BASE_URL=https://api-platform.insait.io
+   INSAIT_BASE_URL=https://api-platform.insait.io   # optional — this is the default
    BUGFIXER_OUTPUT_DIR=<folder where reports are written>
    BUGFIXER_KB_DIR=<folder holding the knowledge/ files>
    ```
@@ -66,7 +71,7 @@ Claude will call the tools automatically:
 ## Repo layout
 
 ```
-server.py           MCP server + the 3 tools (stdio transport)
+server.py           MCP server + the 4 tools (stdio transport)
 knowledge/          Best-practices + session knowledge fed into every analysis
 reports/            Generated bug reports (per agent)
 .mcp.json           MCP client registration
