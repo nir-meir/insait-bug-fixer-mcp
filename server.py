@@ -43,8 +43,21 @@ import mcp.types as types
 # already set by the launcher are not overridden.
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
-INSAIT_API_KEY = os.environ.get("INSAIT_API_KEY")
-INSAIT_BASE_URL = os.environ.get("INSAIT_BASE_URL", "https://api-platform.insait.io")
+# Environment selector: "dev" (default) or "prod". Each environment has its
+# own workspace-scoped API key (INSAIT_API_KEY_DEV / INSAIT_API_KEY_PROD);
+# a plain INSAIT_API_KEY still works as a fallback for either environment.
+INSAIT_ENV = os.environ.get("INSAIT_ENV", "dev").strip().lower()
+
+INSAIT_API_KEY = (
+    os.environ.get(f"INSAIT_API_KEY_{INSAIT_ENV.upper()}")
+    or os.environ.get("INSAIT_API_KEY")
+)
+# Base URL can also differ per environment (INSAIT_BASE_URL_DEV / _PROD);
+# falls back to the shared INSAIT_BASE_URL, then the platform default.
+INSAIT_BASE_URL = (
+    os.environ.get(f"INSAIT_BASE_URL_{INSAIT_ENV.upper()}")
+    or os.environ.get("INSAIT_BASE_URL", "https://api-platform.insait.io")
+)
 BUGFIXER_OUTPUT_DIR = os.environ.get("BUGFIXER_OUTPUT_DIR")
 BUGFIXER_KB_DIR = os.environ.get("BUGFIXER_KB_DIR")
 

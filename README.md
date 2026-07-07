@@ -39,8 +39,11 @@ Typical flow: **gather → analyze (Claude) → save → (optional) correct.**
 
 2. Create a `.env` file next to `server.py`:
    ```
-   INSAIT_API_KEY=<your Insait API key>
+   INSAIT_ENV=dev                                   # which key to use: dev or prod
+   INSAIT_API_KEY_DEV=<your Insait dev API key>
+   INSAIT_API_KEY_PROD=<your Insait prod API key>
    INSAIT_BASE_URL=https://api-platform.insait.io   # optional — this is the default
+   # Optional per-env overrides: INSAIT_BASE_URL_DEV / INSAIT_BASE_URL_PROD
    BUGFIXER_OUTPUT_DIR=<folder where reports are written>
    BUGFIXER_KB_DIR=<folder holding the knowledge/ files>
    ```
